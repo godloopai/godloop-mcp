@@ -16,9 +16,23 @@ With Go:
 go install github.com/godloopai/godloop-mcp@latest
 ```
 
-Or grab a prebuilt binary from
+This drops `godloop-mcp` into `$(go env GOPATH)/bin` — make sure that's on
+your `PATH` (`export PATH="$PATH:$(go env GOPATH)/bin"`), or the
+`claude mcp add` step below won't find the binary.
+
+No Go? Grab a prebuilt binary from
 [Releases](https://github.com/godloopai/godloop-mcp/releases) (linux/macOS
-amd64+arm64, windows amd64).
+amd64+arm64, windows amd64):
+
+```bash
+curl -fL -o godloop-mcp \
+  https://github.com/godloopai/godloop-mcp/releases/latest/download/godloop-mcp_linux_amd64
+chmod +x godloop-mcp
+sudo mv godloop-mcp /usr/local/bin/
+```
+
+(Swap `linux_amd64` for your platform; on macOS you may need
+`xattr -d com.apple.quarantine /usr/local/bin/godloop-mcp` the first run.)
 
 ## Register with Claude Code
 
@@ -26,7 +40,15 @@ amd64+arm64, windows amd64).
 claude mcp add godloop --env GODLOOP_KEY=<your-key> -- godloop-mcp
 ```
 
-Get your key at [godloop.ai](https://godloop.ai).
+Get your key at [godloop.ai](https://godloop.ai) — dashboard → ai subs →
+api keys → create.
+
+Then in each repo you want godloop to pull tasks for, drop a `.godloop`
+file with the project id (shown on your project's page at godloop.ai):
+
+```bash
+echo '<project-id>' > .godloop
+```
 
 ## Config
 
