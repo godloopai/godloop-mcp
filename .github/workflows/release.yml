@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 jobs:
-  godloop-mcp:
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,18 +16,23 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Cross-compile godloop-mcp
+      - name: Cross-compile release binaries
         env:
           CGO_ENABLED: 0
         run: |
           mkdir -p dist
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
-            export GOOS=${target%/*} GOARCH=${target#*/}
-            ext=""
-            [ "$GOOS" = "windows" ] && ext=".exe"
-            go build -trimpath -ldflags="-s -w" \
-              -o "dist/godloop-mcp_${GOOS}_${GOARCH}${ext}" .
+          for command in "godloop-mcp:." "godloop:./cmd/godloop"; do
+            name=${command%%:*}
+            pkg=${command#*:}
+            for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+              export GOOS=${target%/*} GOARCH=${target#*/}
+              ext=""
+              [ "$GOOS" = "windows" ] && ext=".exe"
+              go build -trimpath -ldflags="-s -w" \
+                -o "dist/${name}_${GOOS}_${GOARCH}${ext}" "$pkg"
+            done
           done
+          (cd dist && sha256sum * > checksums.txt)
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

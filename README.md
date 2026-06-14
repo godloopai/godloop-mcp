@@ -1,14 +1,72 @@
-# godloop-mcp
+# godloop CLI + MCP
 
-Tiny stdio MCP client for [godloop.ai](https://godloop.ai) — an AI
+Public command-line tools for [godloop.ai](https://godloop.ai) — an AI
 tokenmaxxing productivity app that makes you use the tokens you already pay
 for.
 
-It exposes one tool, `loop`. Call it at the top of every `/loop` tick: it
-reports the previous tick, returns the next task to work on, shows usage
-across your AI subs, and tells your agent when to schedule the next tick.
+This repo ships two binaries:
 
-## Install
+- `godloop`: the local runner CLI. Use this first.
+- `godloop-mcp`: the stdio MCP connector for native MCP sessions.
+
+## Install the runner
+
+With Go:
+
+```bash
+go install github.com/godloopai/godloop-mcp/cmd/godloop@latest
+godloop login
+```
+
+This does not require `sudo`. It drops `godloop` into `$(go env GOPATH)/bin` —
+make sure that directory is on your `PATH`:
+
+```bash
+export PATH="$PATH:$(go env GOPATH)/bin"
+```
+
+No Go? Grab a prebuilt binary from
+[Releases](https://github.com/godloopai/godloop-mcp/releases) (linux/macOS
+amd64+arm64, windows amd64):
+
+```bash
+curl -fL -o godloop \
+  https://github.com/godloopai/godloop-mcp/releases/latest/download/godloop_linux_amd64
+chmod +x godloop
+mkdir -p "$HOME/.local/bin"
+mv godloop "$HOME/.local/bin/"
+```
+
+No `sudo` is needed if `$HOME/.local/bin` is on your `PATH`. You only need
+`sudo` if you choose to move the binary into a system directory like
+`/usr/local/bin`.
+
+Swap `linux_amd64` for your platform. On macOS you may need:
+
+```bash
+xattr -d com.apple.quarantine "$HOME/.local/bin/godloop"
+```
+
+## Use the runner
+
+```bash
+godloop login
+godloop status
+godloop once -project <project-id> -agent codex -workdir /path/to/repo
+```
+
+For unattended provider bypass modes, run inside Docker/devcontainer or another
+isolated environment:
+
+```bash
+godloop once -project <project-id> -agent codex -workdir /path/to/repo -danger
+```
+
+`godloop login` opens a browser approval URL and stores the machine credential
+in your user config directory. The dashboard shows this as a connected machine,
+not as a key you have to copy around.
+
+## Install the MCP connector
 
 With Go:
 
@@ -16,23 +74,12 @@ With Go:
 go install github.com/godloopai/godloop-mcp@latest
 ```
 
-This drops `godloop-mcp` into `$(go env GOPATH)/bin` — make sure that's on
-your `PATH` (`export PATH="$PATH:$(go env GOPATH)/bin"`), or the
-`claude mcp add` step below won't find the binary.
+Or download `godloop-mcp_<platform>_<arch>` from
+[Releases](https://github.com/godloopai/godloop-mcp/releases).
 
-No Go? Grab a prebuilt binary from
-[Releases](https://github.com/godloopai/godloop-mcp/releases) (linux/macOS
-amd64+arm64, windows amd64):
-
-```bash
-curl -fL -o godloop-mcp \
-  https://github.com/godloopai/godloop-mcp/releases/latest/download/godloop-mcp_linux_amd64
-chmod +x godloop-mcp
-sudo mv godloop-mcp /usr/local/bin/
-```
-
-(Swap `linux_amd64` for your platform; on macOS you may need
-`xattr -d com.apple.quarantine /usr/local/bin/godloop-mcp` the first run.)
+`godloop-mcp` exposes one MCP tool, `loop`. Call it at the top of every `/loop`
+tick: it reports the previous tick, returns the next task to work on, shows
+usage across your AI subs, and tells your agent when to schedule the next tick.
 
 ## Register with Claude Code
 
@@ -40,8 +87,8 @@ sudo mv godloop-mcp /usr/local/bin/
 claude mcp add godloop --env GODLOOP_KEY=<your-key> -- godloop-mcp
 ```
 
-Get your key at [godloop.ai](https://godloop.ai) — dashboard → ai subs →
-api keys → create.
+Use `godloop login` for the normal machine connection flow. Manual
+`GODLOOP_KEY` handling is an advanced fallback for MCP-only setups.
 
 Then in each repo you want godloop to pull tasks for, drop a `.godloop`
 file with the project id (shown on your project's page at godloop.ai):
@@ -81,6 +128,7 @@ MCP client to run the new version.
 
 ```bash
 CGO_ENABLED=0 go build -o godloop-mcp .
+CGO_ENABLED=0 go build -o godloop ./cmd/godloop
 ```
 
 No dependencies — Go stdlib only.
