@@ -62,6 +62,10 @@ isolated environment:
 godloop once -project <project-id> -agent codex -workdir /path/to/repo -danger
 ```
 
+While a prompt is running, the CLI tees provider output to your terminal and
+sends bounded progress summaries back to godloop every 20 seconds. Use
+`-progress-interval 0` to disable live progress reports for a run.
+
 `godloop login` opens a browser approval URL and stores the machine credential
 in your user config directory. The dashboard shows this as a connected machine,
 not as a key you have to copy around.

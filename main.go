@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-const version = "0.3.1-alpha"
+const version = "0.3.2-alpha"
 
 const (
 	defaultMaxPromptChars = 4000

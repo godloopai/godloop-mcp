@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -101,6 +102,16 @@ type loopTask struct {
 type usage struct {
 	Input  int64
 	Output int64
+}
+
+type reportPayload struct {
+	EnvironmentID int64  `json:"environment_id"`
+	TaskID        *int64 `json:"task_id,omitempty"`
+	AISubID       *int64 `json:"ai_sub_id,omitempty"`
+	Outcome       string `json:"outcome"`
+	Summary       string `json:"summary"`
+	InputTokens   int64  `json:"input_tokens"`
+	OutputTokens  int64  `json:"output_tokens"`
 }
 
 func main() {
@@ -223,6 +234,7 @@ func once(args []string) error {
 	danger := fs.Bool("danger", false, "use provider bypass/danger mode; run inside a container")
 	subID := fs.Int64("sub", 0, "AI sub id to charge usage against")
 	maxPromptChars := fs.Int("max-prompt-chars", 8000, "max prompt chars to request")
+	progressInterval := fs.Duration("progress-interval", 20*time.Second, "how often to send live progress while an agent runs")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -263,25 +275,43 @@ func once(args []string) error {
 		fmt.Println("Prompt was truncated by server max_prompt_chars.")
 	}
 
-	out, use, runErr := runAgent(*agent, *workdir, loop.Task.Prompt, *danger)
+	taskID := loop.Task.ID
+	var reportSubID *int64
+	if *subID > 0 {
+		reportSubID = subID
+	}
+	progress := func(tail string) {
+		if strings.TrimSpace(tail) == "" {
+			tail = "Agent is still running."
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := sendReport(ctx, *apiURL, *key, reportPayload{
+			EnvironmentID: loop.EnvironmentID,
+			TaskID:        &taskID,
+			AISubID:       reportSubID,
+			Outcome:       "progress",
+			Summary:       summarizeOutput(tail),
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: failed to report progress:", err)
+		}
+	}
+
+	out, use, runErr := runAgent(*agent, *workdir, loop.Task.Prompt, *danger, *progressInterval, progress)
 	outcome := "done"
 	if runErr != nil {
 		outcome = "error"
 	}
 	summary := summarizeOutput(out)
-	report := map[string]any{
-		"environment_id": loop.EnvironmentID,
-		"task_id":        loop.Task.ID,
-		"outcome":        outcome,
-		"summary":        summary,
-		"input_tokens":   use.Input,
-		"output_tokens":  use.Output,
-	}
-	if *subID > 0 {
-		report["ai_sub_id"] = *subID
-	}
-	var reportResp map[string]bool
-	if err := apiRequest(context.Background(), "POST", *apiURL, "/api/v1/mcp/report", *key, report, &reportResp); err != nil {
+	if err := sendReport(context.Background(), *apiURL, *key, reportPayload{
+		EnvironmentID: loop.EnvironmentID,
+		TaskID:        &taskID,
+		AISubID:       reportSubID,
+		Outcome:       outcome,
+		Summary:       summary,
+		InputTokens:   use.Input,
+		OutputTokens:  use.Output,
+	}); err != nil {
 		return err
 	}
 	if runErr != nil {
@@ -289,6 +319,11 @@ func once(args []string) error {
 	}
 	fmt.Println(summary)
 	return nil
+}
+
+func sendReport(ctx context.Context, apiURL, key string, report reportPayload) error {
+	var reportResp map[string]bool
+	return apiRequest(ctx, "POST", apiURL, "/api/v1/mcp/report", key, report, &reportResp)
 }
 
 func logout() error {
@@ -303,7 +338,7 @@ func logout() error {
 	return nil
 }
 
-func runAgent(agent, workdir, prompt string, danger bool) (string, usage, error) {
+func runAgent(agent, workdir, prompt string, danger bool, progressInterval time.Duration, progress func(string)) (string, usage, error) {
 	switch strings.ToLower(agent) {
 	case "codex":
 		args := []string{"exec", "--cd", workdir, "--json"}
@@ -313,7 +348,7 @@ func runAgent(agent, workdir, prompt string, danger bool) (string, usage, error)
 			args = append(args, "--sandbox", "workspace-write")
 		}
 		args = append(args, prompt)
-		return runCommand("codex", args...)
+		return runCommand("codex", args, progressInterval, progress)
 	case "claude":
 		args := []string{"-p", "--output-format", "json"}
 		if danger {
@@ -322,23 +357,93 @@ func runAgent(agent, workdir, prompt string, danger bool) (string, usage, error)
 			args = append(args, "--permission-mode", "auto")
 		}
 		args = append(args, prompt)
-		return runCommand("claude", args...)
+		return runCommand("claude", args, progressInterval, progress)
 	default:
 		return "", usage{}, fmt.Errorf("unknown agent %q", agent)
 	}
 }
 
-func runCommand(name string, args ...string) (string, usage, error) {
+func runCommand(name string, args []string, progressInterval time.Duration, progress func(string)) (string, usage, error) {
 	cmd := exec.Command(name, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	out := stdout.String()
-	if stderr.Len() > 0 {
-		out += "\n" + stderr.String()
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", usage{}, err
 	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return "", usage{}, err
+	}
+	var mu sync.Mutex
+	var full bytes.Buffer
+	tail := make([]byte, 0, 8192)
+	appendChunk := func(w io.Writer, p []byte) {
+		_, _ = w.Write(p)
+		mu.Lock()
+		full.Write(p)
+		tail = append(tail, p...)
+		if len(tail) > 8192 {
+			tail = tail[len(tail)-8192:]
+		}
+		mu.Unlock()
+	}
+	snapshot := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return string(tail)
+	}
+	if err := cmd.Start(); err != nil {
+		return "", usage{}, err
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = copyChunks(stdout, func(p []byte) { appendChunk(os.Stdout, p) })
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = copyChunks(stderr, func(p []byte) { appendChunk(os.Stderr, p) })
+	}()
+	done := make(chan struct{})
+	if progress != nil && progressInterval > 0 {
+		go func() {
+			ticker := time.NewTicker(progressInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					next := snapshot()
+					progress(next)
+				case <-done:
+					return
+				}
+			}
+		}()
+	}
+	err = cmd.Wait()
+	close(done)
+	wg.Wait()
+	out := full.String()
 	return out, parseUsage(out), err
+}
+
+func copyChunks(r io.Reader, onChunk func([]byte)) (int64, error) {
+	buf := make([]byte, 4096)
+	var total int64
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			chunk := append([]byte(nil), buf[:n]...)
+			onChunk(chunk)
+			total += int64(n)
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return total, nil
+			}
+			return total, err
+		}
+	}
 }
 
 func parseUsage(output string) usage {
