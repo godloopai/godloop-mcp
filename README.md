@@ -57,9 +57,25 @@ echo '<project-id>' > .godloop
 | `GODLOOP_KEY` | yes | — |
 | `GODLOOP_URL` | no | `https://godloop.ai` |
 | `GODLOOP_PROJECT` | no | read from `.godloop` file in project root |
+| `GODLOOP_MAX_PROMPT_CHARS` | no | `4000` |
+| `GODLOOP_AUTO_UPDATE` | no | `notify` |
 
 The `.godloop` file holds either the raw project id or
 `{"project_id": "..."}`.
+
+`GODLOOP_MAX_PROMPT_CHARS` bounds how much of the claimed prompt is returned to
+the MCP client. The server also caps this, but keeping the client default low
+prevents stale context from eating tokens.
+
+`GODLOOP_AUTO_UPDATE` controls startup update checks:
+
+- `off`: no update check
+- `notify`: print an update notice to stderr only
+- `minor`: run `go install github.com/godloopai/godloop-mcp@latest` for newer versions with the same major version
+- `always`: run that update command for any newer version
+
+Auto-update replaces the installed binary for the next MCP process; restart the
+MCP client to run the new version.
 
 ## Build from source
 

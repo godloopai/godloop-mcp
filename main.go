@@ -10,13 +10,23 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
+	"strconv"
 	"strings"
 	"time"
+)
+
+const version = "0.2.1-alpha"
+
+const (
+	defaultMaxPromptChars = 4000
+	maxPromptChars        = 20000
 )
 
 type rpcReq struct {
@@ -24,6 +34,54 @@ type rpcReq struct {
 	ID      json.RawMessage `json:"id"`
 	Method  string          `json:"method"`
 	Params  json.RawMessage `json:"params"`
+}
+
+type updateManifest struct {
+	LatestVersion       string   `json:"latest_version"`
+	MinSupportedVersion string   `json:"min_supported_version"`
+	DefaultPolicy       string   `json:"default_policy"`
+	Policies            []string `json:"policies"`
+	InstallCommand      string   `json:"install_command"`
+	ReleasesURL         string   `json:"releases_url"`
+}
+
+type apiEnvelope[T any] struct {
+	Data T `json:"data"`
+}
+
+type loopResp struct {
+	EnvironmentID     int64      `json:"environment_id"`
+	Task              *loopTask  `json:"task"`
+	Subs              []subUsage `json:"subs"`
+	NextCallSeconds   int64      `json:"next_call_seconds"`
+	ServerTime        int64      `json:"server_time"`
+	MaxPromptChars    int        `json:"max_prompt_chars"`
+	ContextBudgetHint string     `json:"context_budget_hint"`
+}
+
+type loopTask struct {
+	ID              int64  `json:"id"`
+	ProjectID       string `json:"project_id"`
+	Title           string `json:"title"`
+	Prompt          string `json:"prompt"`
+	Command         string `json:"command"`
+	Status          string `json:"status"`
+	ClaimedBy       *int64 `json:"claimed_by"`
+	ClaimExpiresAt  int64  `json:"claim_expires_at"`
+	PromptTruncated bool   `json:"prompt_truncated"`
+}
+
+type subUsage struct {
+	ID                    int64  `json:"id"`
+	Name                  string `json:"name"`
+	Type                  string `json:"type"`
+	Status                string `json:"status"`
+	EstTokensUsed         int64  `json:"est_tokens_used"`
+	WeeklyTokenAllowance  int64  `json:"weekly_token_allowance"`
+	ResetAt               int64  `json:"reset_at"`
+	SessionTokens         int64  `json:"session_tokens"`
+	SessionStartedAt      int64  `json:"session_started_at"`
+	SessionTokenAllowance int64  `json:"session_token_allowance"`
 }
 
 func reply(id json.RawMessage, result any) {
@@ -57,6 +115,152 @@ func projectID() string {
 	return s
 }
 
+func baseURL() string {
+	base := strings.TrimRight(os.Getenv("GODLOOP_URL"), "/")
+	if base == "" {
+		base = "https://godloop.ai"
+	}
+	return base
+}
+
+func clampInt(v, fallback, max int) int {
+	if v <= 0 {
+		return fallback
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+func configuredMaxPromptChars() int {
+	if raw := strings.TrimSpace(os.Getenv("GODLOOP_MAX_PROMPT_CHARS")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			return clampInt(n, defaultMaxPromptChars, maxPromptChars)
+		}
+	}
+	return defaultMaxPromptChars
+}
+
+func parseSemver(v string) (int, int, int, bool) {
+	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	parts := strings.Split(v, ".")
+	if len(parts) < 2 {
+		return 0, 0, 0, false
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	patch := 0
+	if len(parts) > 2 {
+		patchPart := parts[2]
+		if i := strings.IndexFunc(patchPart, func(r rune) bool { return r < '0' || r > '9' }); i >= 0 {
+			patchPart = patchPart[:i]
+		}
+		patch, _ = strconv.Atoi(patchPart)
+	}
+	return major, minor, patch, true
+}
+
+func versionGreater(a, b string) bool {
+	amaj, amin, apat, okA := parseSemver(a)
+	bmaj, bmin, bpat, okB := parseSemver(b)
+	if !okA || !okB {
+		return a != "" && a != b
+	}
+	if amaj != bmaj {
+		return amaj > bmaj
+	}
+	if amin != bmin {
+		return amin > bmin
+	}
+	return apat > bpat
+}
+
+func sameMajor(a, b string) bool {
+	amaj, _, _, okA := parseSemver(a)
+	bmaj, _, _, okB := parseSemver(b)
+	return okA && okB && amaj == bmaj
+}
+
+func fetchUpdateManifest() (updateManifest, error) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(baseURL() + "/api/v1/mcp/version")
+	if err != nil {
+		return updateManifest{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return updateManifest{}, fmt.Errorf("version endpoint returned %d", resp.StatusCode)
+	}
+	var envelope apiEnvelope[updateManifest]
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&envelope); err != nil {
+		return updateManifest{}, err
+	}
+	return envelope.Data, nil
+}
+
+func updatePolicy() string {
+	policy := strings.ToLower(strings.TrimSpace(os.Getenv("GODLOOP_AUTO_UPDATE")))
+	if policy == "" {
+		policy = "notify"
+	}
+	switch policy {
+	case "off", "notify", "minor", "always":
+		return policy
+	default:
+		return "notify"
+	}
+}
+
+func shouldInstallUpdate(policy string, manifest updateManifest) bool {
+	if !versionGreater(manifest.LatestVersion, version) {
+		return false
+	}
+	switch policy {
+	case "always":
+		return true
+	case "minor":
+		return sameMajor(manifest.LatestVersion, version)
+	default:
+		return false
+	}
+}
+
+func checkForUpdate() {
+	policy := updatePolicy()
+	if policy == "off" {
+		return
+	}
+	manifest, err := fetchUpdateManifest()
+	if err != nil || !versionGreater(manifest.LatestVersion, version) {
+		return
+	}
+	msg := fmt.Sprintf("godloop-mcp %s available; current %s", manifest.LatestVersion, version)
+	if manifest.InstallCommand != "" {
+		msg += "; update with: " + manifest.InstallCommand
+	}
+	if !shouldInstallUpdate(policy, manifest) {
+		fmt.Fprintln(os.Stderr, msg)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "install", "github.com/godloopai/godloop-mcp@latest")
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "%s; auto-update failed: %v\n", msg, err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "godloop-mcp updated to %s; restart the MCP client to use it\n", manifest.LatestVersion)
+}
+
 var loopTool = map[string]any{
 	"name": "loop",
 	"description": "godloop tick: call once at the start of every /loop iteration. " +
@@ -82,6 +286,10 @@ var loopTool = map[string]any{
 				"type":        "integer",
 				"description": "which AI subscription this environment burns (optional)",
 			},
+			"max_prompt_chars": map[string]any{
+				"type":        "integer",
+				"description": "max prompt characters to return for the claimed task; defaults to a compact 4000",
+			},
 		},
 	},
 }
@@ -91,18 +299,16 @@ func callLoop(args json.RawMessage) (string, error) {
 	if key == "" {
 		return "", fmt.Errorf("GODLOOP_KEY not set")
 	}
-	base := os.Getenv("GODLOOP_URL")
-	if base == "" {
-		base = "https://godloop.ai"
-	}
+	base := baseURL()
 	pid := projectID()
 	if pid == "" {
 		return "", fmt.Errorf("no project id: create a .godloop file with your project's public id (see godloop.ai dashboard)")
 	}
 
 	var in struct {
-		Report  map[string]any `json:"report"`
-		AISubID *int64         `json:"ai_sub_id"`
+		Report         map[string]any `json:"report"`
+		AISubID        *int64         `json:"ai_sub_id"`
+		MaxPromptChars int            `json:"max_prompt_chars"`
 	}
 	if len(args) > 0 {
 		json.Unmarshal(args, &in)
@@ -116,7 +322,12 @@ func callLoop(args json.RawMessage) (string, error) {
 		in.Report["output_tokens"] = mo
 	}
 	host, _ := os.Hostname()
-	body := map[string]any{"project_id": pid, "name": host, "kind": kind()}
+	body := map[string]any{
+		"project_id":       pid,
+		"name":             host,
+		"kind":             kind(),
+		"max_prompt_chars": clampInt(in.MaxPromptChars, configuredMaxPromptChars(), maxPromptChars),
+	}
 	if in.Report != nil {
 		body["report"] = in.Report
 	}
@@ -144,7 +355,51 @@ func callLoop(args json.RawMessage) (string, error) {
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("godloop api %d: %s", resp.StatusCode, strings.TrimSpace(string(out)))
 	}
-	return string(out), nil
+	return compactLoopOutput(out), nil
+}
+
+func compactLoopOutput(raw []byte) string {
+	var envelope apiEnvelope[loopResp]
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return string(raw)
+	}
+	resp := envelope.Data
+	var b strings.Builder
+	b.WriteString("godloop loop\n")
+	if resp.Task == nil {
+		b.WriteString("task: none\n")
+	} else {
+		fmt.Fprintf(&b, "task: #%d %s\n", resp.Task.ID, resp.Task.Title)
+		if resp.Task.Prompt != "" {
+			b.WriteString("prompt:\n")
+			b.WriteString(resp.Task.Prompt)
+			b.WriteString("\n")
+		}
+		if resp.Task.PromptTruncated {
+			b.WriteString("prompt_truncated: true\n")
+		}
+	}
+	if len(resp.Subs) > 0 {
+		b.WriteString("subscriptions:\n")
+		for _, sub := range resp.Subs {
+			fmt.Fprintf(&b, "- %s (%s): status=%s", sub.Name, sub.Type, sub.Status)
+			if sub.SessionTokenAllowance > 0 {
+				fmt.Fprintf(&b, ", session=%d/%d", sub.SessionTokens, sub.SessionTokenAllowance)
+			}
+			if sub.WeeklyTokenAllowance > 0 {
+				fmt.Fprintf(&b, ", weekly=%d/%d", sub.EstTokensUsed, sub.WeeklyTokenAllowance)
+			}
+			b.WriteString("\n")
+		}
+	}
+	if resp.MaxPromptChars > 0 {
+		fmt.Fprintf(&b, "max_prompt_chars: %d\n", resp.MaxPromptChars)
+	}
+	if resp.ContextBudgetHint != "" {
+		fmt.Fprintf(&b, "context_budget_hint: %s\n", resp.ContextBudgetHint)
+	}
+	fmt.Fprintf(&b, "next_call_seconds: %d", resp.NextCallSeconds)
+	return b.String()
 }
 
 func kind() string {
@@ -266,6 +521,7 @@ func scanJSONL(path string, since time.Time) (int64, int64) {
 }
 
 func main() {
+	go checkForUpdate()
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20)
 	for scanner.Scan() {
@@ -282,7 +538,7 @@ func main() {
 			reply(req.ID, map[string]any{
 				"protocolVersion": "2024-11-05",
 				"capabilities":    map[string]any{"tools": map[string]any{}},
-				"serverInfo":      map[string]any{"name": "godloop", "version": "0.1.0"},
+				"serverInfo":      map[string]any{"name": "godloop", "version": version},
 			})
 		case "notifications/initialized":
 			// notification, no response
