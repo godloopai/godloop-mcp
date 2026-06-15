@@ -82,6 +82,8 @@ type currentWork struct {
 
 type loopResponse struct {
 	EnvironmentID   int64     `json:"environment_id"`
+	Action          string    `json:"action"` // work | idle | backoff ("" = old server)
+	Reason          string    `json:"reason"`
 	Task            *loopTask `json:"task"`
 	NextCallSeconds int64     `json:"next_call_seconds"`
 	ServerTime      int64     `json:"server_time"`
@@ -265,8 +267,21 @@ func once(args []string) error {
 	if err := apiRequest(context.Background(), "POST", *apiURL, "/api/v1/mcp/loop", *key, body, &loop); err != nil {
 		return err
 	}
-	if loop.Task == nil {
-		fmt.Println("No queued prompt.")
+	// The server decides the move from usage: work (run it), idle (stand by),
+	// backoff (near a usage limit — wait longer). Empty action = old server.
+	action := loop.Action
+	if action == "" {
+		action = "idle"
+		if loop.Task != nil {
+			action = "work"
+		}
+	}
+	if action != "work" || loop.Task == nil {
+		reason := loop.Reason
+		if reason == "" {
+			reason = "no queued prompt"
+		}
+		fmt.Printf("%s — %s\n", strings.ToUpper(action), reason)
 		fmt.Printf("Next check: %s\n", time.Duration(loop.NextCallSeconds)*time.Second)
 		return nil
 	}

@@ -51,6 +51,8 @@ type apiEnvelope[T any] struct {
 
 type loopResp struct {
 	EnvironmentID     int64      `json:"environment_id"`
+	Action            string     `json:"action"` // work | idle | backoff
+	Reason            string     `json:"reason"`
 	Task              *loopTask  `json:"task"`
 	Subs              []subUsage `json:"subs"`
 	NextCallSeconds   int64      `json:"next_call_seconds"`
@@ -265,9 +267,11 @@ var loopTool = map[string]any{
 	"name": "loop",
 	"description": "godloop tick: call once at the start of every /loop iteration. " +
 		"Pass a report of what happened last tick (task outcome + token usage). " +
-		"Returns the next task to work on (claim it by working on it), token usage " +
-		"across your AI subscriptions with reset times, and next_call_seconds — " +
-		"schedule the next /loop tick that many seconds from now.",
+		"Returns an action you must honour — work (do the returned task), idle " +
+		"(no work; just wait), or backoff (a usage limit is near; do NOT run work, " +
+		"wait the full interval) — plus the next task, token usage across your AI " +
+		"subscriptions with reset times, and next_call_seconds: schedule the next " +
+		"/loop tick that many seconds from now.",
 	"inputSchema": map[string]any{
 		"type": "object",
 		"properties": map[string]any{
@@ -366,6 +370,13 @@ func compactLoopOutput(raw []byte) string {
 	resp := envelope.Data
 	var b strings.Builder
 	b.WriteString("godloop loop\n")
+	if resp.Action != "" {
+		fmt.Fprintf(&b, "action: %s", resp.Action)
+		if resp.Reason != "" {
+			fmt.Fprintf(&b, " — %s", resp.Reason)
+		}
+		b.WriteString("\n")
+	}
 	if resp.Task == nil {
 		b.WriteString("task: none\n")
 	} else {
