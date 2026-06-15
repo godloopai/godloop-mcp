@@ -301,7 +301,9 @@ func once(args []string) error {
 		}
 	}
 
-	out, use, runErr := runAgent(*agent, *workdir, loop.Task.Prompt, *danger, *progressInterval, progress)
+	stream := startSessionStream(*apiURL, *key, loop.EnvironmentID, loop.Task.ProjectID, taskID, loop.Task.Title)
+	defer stream.close()
+	out, use, runErr := runAgent(*agent, *workdir, loop.Task.Prompt, *danger, *progressInterval, progress, stream.write)
 	outcome := "done"
 	if runErr != nil {
 		outcome = "error"
@@ -342,7 +344,68 @@ func logout() error {
 	return nil
 }
 
-func runAgent(agent, workdir, prompt string, danger bool, progressInterval time.Duration, progress func(string)) (string, usage, error) {
+// sessionStreamer mirrors the agent's terminal output to godloop so the
+// dashboard can watch it live. Best-effort: failures never stop the run.
+type sessionStreamer struct {
+	apiURL, key, id string
+	ch              chan []byte
+	done            chan struct{}
+}
+
+func startSessionStream(apiURL, key string, envID int64, projectID string, taskID int64, title string) *sessionStreamer {
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	body := map[string]any{"environment_id": envID, "project_id": projectID, "task_id": taskID, "title": title}
+	if err := apiRequest(context.Background(), "POST", apiURL, "/api/v1/sessions", key, body, &created); err != nil || created.Data.ID == "" {
+		return nil
+	}
+	s := &sessionStreamer{apiURL: apiURL, key: key, id: created.Data.ID, ch: make(chan []byte, 256), done: make(chan struct{})}
+	go func() {
+		defer close(s.done)
+		for chunk := range s.ch {
+			s.post("/api/v1/sessions/"+s.id+"/append", bytes.NewReader(chunk))
+		}
+	}()
+	return s
+}
+
+func (s *sessionStreamer) post(path string, body io.Reader) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "POST", s.apiURL+path, body)
+	if err != nil {
+		return
+	}
+	req.Header.Set("X-Godloop-Key", s.key)
+	if resp, err := http.DefaultClient.Do(req); err == nil {
+		resp.Body.Close()
+	}
+}
+
+func (s *sessionStreamer) write(p []byte) {
+	if s == nil {
+		return
+	}
+	cp := append([]byte(nil), p...)
+	select {
+	case s.ch <- cp:
+	default: // viewer backed up — drop to keep the agent unblocked
+	}
+}
+
+func (s *sessionStreamer) close() {
+	if s == nil {
+		return
+	}
+	close(s.ch)
+	<-s.done
+	s.post("/api/v1/sessions/"+s.id+"/close", nil)
+}
+
+func runAgent(agent, workdir, prompt string, danger bool, progressInterval time.Duration, progress func(string), stream func([]byte)) (string, usage, error) {
 	switch strings.ToLower(agent) {
 	case "codex":
 		args := []string{"exec", "--cd", workdir, "--json"}
@@ -352,7 +415,7 @@ func runAgent(agent, workdir, prompt string, danger bool, progressInterval time.
 			args = append(args, "--sandbox", "workspace-write")
 		}
 		args = append(args, prompt)
-		return runCommand("codex", args, progressInterval, progress)
+		return runCommand("codex", args, progressInterval, progress, stream)
 	case "claude":
 		args := []string{"-p", "--output-format", "json"}
 		if danger {
@@ -361,13 +424,13 @@ func runAgent(agent, workdir, prompt string, danger bool, progressInterval time.
 			args = append(args, "--permission-mode", "auto")
 		}
 		args = append(args, prompt)
-		return runCommand("claude", args, progressInterval, progress)
+		return runCommand("claude", args, progressInterval, progress, stream)
 	default:
 		return "", usage{}, fmt.Errorf("unknown agent %q", agent)
 	}
 }
 
-func runCommand(name string, args []string, progressInterval time.Duration, progress func(string)) (string, usage, error) {
+func runCommand(name string, args []string, progressInterval time.Duration, progress func(string), stream func([]byte)) (string, usage, error) {
 	cmd := exec.Command(name, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -382,6 +445,9 @@ func runCommand(name string, args []string, progressInterval time.Duration, prog
 	tail := make([]byte, 0, 8192)
 	appendChunk := func(w io.Writer, p []byte) {
 		_, _ = w.Write(p)
+		if stream != nil {
+			stream(p)
+		}
 		mu.Lock()
 		full.Write(p)
 		tail = append(tail, p...)
