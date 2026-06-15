@@ -183,11 +183,13 @@ func login(args []string) error {
 			if polled.Key == "" {
 				continue
 			}
-			cfg := config{APIURL: strings.TrimRight(*apiURL, "/"), Key: polled.Key, Machine: *name}
+			// the browser may have bound this runner to a chosen workspace
+			ws := firstNonEmpty(polled.Name, *name)
+			cfg := config{APIURL: strings.TrimRight(*apiURL, "/"), Key: polled.Key, Machine: ws}
 			if err := saveConfig(cfg); err != nil {
 				return err
 			}
-			fmt.Println("Connected", *name)
+			fmt.Println("Connected workspace:", ws)
 			return nil
 		case "expired":
 			return errors.New("pairing code expired")
@@ -229,7 +231,7 @@ func once(args []string) error {
 	apiURL := fs.String("api", "", "godloop API URL")
 	key := fs.String("key", "", "godloop runner key")
 	projectID := fs.String("project", "", "project id from godloop")
-	envName := fs.String("env", hostname(), "environment name")
+	envName := fs.String("env", "", "workspace name (defaults to the one you connected)")
 	kind := fs.String("kind", "local", "environment kind")
 	agent := fs.String("agent", "codex", "codex or claude")
 	workdir := fs.String("workdir", ".", "repo directory")
@@ -252,6 +254,9 @@ func once(args []string) error {
 	}
 	if *key == "" {
 		return errors.New("not connected; run godloop login first")
+	}
+	if strings.TrimSpace(*envName) == "" {
+		*envName = firstNonEmpty(cfg.Machine, hostname())
 	}
 
 	body := map[string]any{
