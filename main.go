@@ -370,13 +370,7 @@ func compactLoopOutput(raw []byte) string {
 	resp := envelope.Data
 	var b strings.Builder
 	b.WriteString("godloop loop\n")
-	if resp.Action != "" {
-		fmt.Fprintf(&b, "action: %s", resp.Action)
-		if resp.Reason != "" {
-			fmt.Fprintf(&b, " — %s", resp.Reason)
-		}
-		b.WriteString("\n")
-	}
+	fmt.Fprintf(&b, "action: %s — %s\n", resp.Action, resp.Reason)
 	if resp.Task == nil {
 		b.WriteString("task: none\n")
 	} else {
