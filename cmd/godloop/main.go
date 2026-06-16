@@ -128,6 +128,8 @@ func main() {
 		err = status(os.Args[2:])
 	case "once":
 		err = once(os.Args[2:])
+	case "loop":
+		err = loopInteractive(os.Args[2:])
 	case "logout":
 		err = logout()
 	default:
@@ -145,6 +147,7 @@ func usageAndExit() {
   godloop status [-api https://godloop.ai] [-key glp_...]
   godloop usage
   godloop once -project <id> [-env name] [-agent codex|claude] [-workdir .] [-danger]
+  godloop loop -project <id> [-workdir .] [-quiet 8s] [-danger]   # persistent interactive Claude session
   godloop logout`)
 	os.Exit(2)
 }
