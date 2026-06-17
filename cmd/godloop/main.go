@@ -165,7 +165,7 @@ func usageAndExit() {
   godloop
   godloop init [-api https://godloop.ai] [-workspace name]
   godloop login [-api https://godloop.ai] [-name machine]
-  godloop run [-agent codex|claude] [-workdir .] [-danger]
+  godloop run [-agent codex|claude] [-workdir .] [-codex-sandbox workspace-write] [-danger]
   godloop status [-api https://godloop.ai] [-key glp_...]
   godloop usage
   godloop once -project <id> [-env name] [-sub id] [-agent codex|claude] [-workdir .] [-danger]
@@ -375,6 +375,7 @@ func runDaemon(args []string) error {
 	agent := fs.String("agent", "", "codex or claude; defaults to selected sub provider, then codex")
 	agentCommand := fs.String("agent-command", "", "provider command prefix; overrides the selected sub runner command")
 	workdir := fs.String("workdir", ".", "repo directory")
+	codexSandbox := fs.String("codex-sandbox", "workspace-write", "Codex sandbox mode: read-only, workspace-write, or danger-full-access")
 	danger := fs.Bool("danger", false, "use provider bypass/danger mode; run inside a container")
 	subID := fs.Int64("sub", 0, "AI sub id to charge usage against")
 	maxPromptChars := fs.Int("max-prompt-chars", 8000, "max prompt chars to request")
@@ -416,7 +417,7 @@ func runDaemon(args []string) error {
 	}
 	fmt.Println("godloop runner online:", *workspace)
 	for ctx.Err() == nil {
-		next, worked, err := runDaemonTick(ctx, *apiURL, *key, *workspace, clean(*kind), *agent, *agentCommand, *workdir, *danger, reportSubID, *maxPromptChars, *progressInterval)
+		next, worked, err := runDaemonTick(ctx, *apiURL, *key, *workspace, clean(*kind), *agent, *agentCommand, *workdir, *codexSandbox, *danger, reportSubID, *maxPromptChars, *progressInterval)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "warning:", err)
 			next = *poll
@@ -434,7 +435,7 @@ func runDaemon(args []string) error {
 	return nil
 }
 
-func runDaemonTick(ctx context.Context, apiURL, key, workspace, kind, agent, agentCommand, workdir string, danger bool, subID *int64, maxPromptChars int, progressInterval time.Duration) (time.Duration, bool, error) {
+func runDaemonTick(ctx context.Context, apiURL, key, workspace, kind, agent, agentCommand, workdir, codexSandbox string, danger bool, subID *int64, maxPromptChars int, progressInterval time.Duration) (time.Duration, bool, error) {
 	var st runnerStatus
 	statusPath := "/api/v1/runner/status?workspace=" + url.QueryEscape(workspace) + "&kind=" + url.QueryEscape(kind)
 	if err := apiRequest(ctx, "GET", apiURL, statusPath, key, nil, &st); err != nil {
@@ -464,7 +465,7 @@ func runDaemonTick(ctx context.Context, apiURL, key, workspace, kind, agent, age
 		}
 		if loop.Action == "work" && loop.Task != nil {
 			fmt.Printf("Running %s: #%d %s\n", project.Name, loop.Task.ID, loop.Task.Title)
-			return next, true, runLoopTask(ctx, apiURL, key, loop, subID, agent, agentCommand, workdir, danger, progressInterval)
+			return next, true, runLoopTask(ctx, apiURL, key, loop, subID, agent, agentCommand, workdir, codexSandbox, danger, progressInterval)
 		}
 	}
 	if next == 0 {
@@ -498,7 +499,7 @@ func callProjectLoop(ctx context.Context, apiURL, key, projectID, workspace, kin
 	return loop, err
 }
 
-func runLoopTask(ctx context.Context, apiURL, key string, loop loopResponse, reportSubID *int64, agent, agentCommand, workdir string, danger bool, progressInterval time.Duration) error {
+func runLoopTask(ctx context.Context, apiURL, key string, loop loopResponse, reportSubID *int64, agent, agentCommand, workdir, codexSandbox string, danger bool, progressInterval time.Duration) error {
 	if loop.Task == nil {
 		return nil
 	}
@@ -532,7 +533,7 @@ func runLoopTask(ctx context.Context, apiURL, key string, loop loopResponse, rep
 
 	stream := startSessionStream(apiURL, key, loop.EnvironmentID, loop.Task.ProjectID, taskID, loop.Task.Title)
 	defer stream.close()
-	out, use, runErr := runAgent(agentName, command, workdir, loop.Task.Prompt, danger, progressInterval, progress, stream.write)
+	out, use, runErr := runAgent(agentName, command, workdir, loop.Task.Prompt, codexSandbox, danger, progressInterval, progress, stream.write)
 	outcome := "done"
 	if runErr != nil {
 		outcome = "error"
@@ -566,6 +567,7 @@ func once(args []string) error {
 	agent := fs.String("agent", "", "codex or claude; defaults to selected sub provider, then codex")
 	agentCommand := fs.String("agent-command", "", "provider command prefix; overrides the selected sub runner command")
 	workdir := fs.String("workdir", ".", "repo directory")
+	codexSandbox := fs.String("codex-sandbox", "workspace-write", "Codex sandbox mode: read-only, workspace-write, or danger-full-access")
 	danger := fs.Bool("danger", false, "use provider bypass/danger mode; run inside a container")
 	subID := fs.Int64("sub", 0, "AI sub id to charge usage against")
 	maxPromptChars := fs.Int("max-prompt-chars", 8000, "max prompt chars to request")
@@ -613,7 +615,7 @@ func once(args []string) error {
 	if loop.Task.PromptTruncated {
 		fmt.Println("Prompt was truncated by server max_prompt_chars.")
 	}
-	return runLoopTask(context.Background(), *apiURL, *key, loop, reportSubID, *agent, *agentCommand, *workdir, *danger, *progressInterval)
+	return runLoopTask(context.Background(), *apiURL, *key, loop, reportSubID, *agent, *agentCommand, *workdir, *codexSandbox, *danger, *progressInterval)
 }
 
 func sendReport(ctx context.Context, apiURL, key string, report reportPayload) error {
@@ -724,14 +726,18 @@ func (s *sessionStreamer) close() {
 	s.post("/api/v1/sessions/"+s.id+"/close", nil)
 }
 
-func runAgent(agent, command, workdir, prompt string, danger bool, progressInterval time.Duration, progress func(string), stream func([]byte)) (string, usage, error) {
+func runAgent(agent, command, workdir, prompt, codexSandbox string, danger bool, progressInterval time.Duration, progress func(string), stream func([]byte)) (string, usage, error) {
 	switch strings.ToLower(agent) {
 	case "codex":
 		args := []string{"exec", "--cd", workdir, "--json"}
 		if danger {
 			args = append(args, "--dangerously-bypass-approvals-and-sandbox")
 		} else {
-			args = append(args, "--sandbox", "workspace-write")
+			sandbox, err := cleanCodexSandbox(codexSandbox)
+			if err != nil {
+				return "", usage{}, err
+			}
+			args = append(args, "--sandbox", sandbox)
 		}
 		args = append(args, prompt)
 		return runProviderCommand("codex", command, args, progressInterval, progress, stream)
@@ -746,6 +752,19 @@ func runAgent(agent, command, workdir, prompt string, danger bool, progressInter
 		return runProviderCommand("claude", command, args, progressInterval, progress, stream)
 	default:
 		return "", usage{}, fmt.Errorf("unknown agent %q", agent)
+	}
+}
+
+func cleanCodexSandbox(mode string) (string, error) {
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		return "workspace-write", nil
+	}
+	switch mode {
+	case "read-only", "workspace-write", "danger-full-access":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("unknown codex sandbox %q; use read-only, workspace-write, or danger-full-access", mode)
 	}
 }
 

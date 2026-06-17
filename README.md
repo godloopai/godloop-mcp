@@ -67,6 +67,14 @@ isolated environment:
 godloop run -agent codex -workdir /path/to/repo -danger
 ```
 
+If Codex reports a local sandbox error such as `bwrap: loopback: Failed
+RTM_NEWADDR`, keep godloop in foreground but ask Codex to use its full-access
+sandbox mode:
+
+```bash
+godloop run -agent codex -workdir /path/to/repo -codex-sandbox danger-full-access
+```
+
 While a prompt is running, the CLI tees provider output to your terminal and
 sends bounded progress summaries back to godloop every 20 seconds. Use
 `-progress-interval 0` to disable live progress reports for a run.
