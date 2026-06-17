@@ -165,7 +165,7 @@ func usageAndExit() {
   godloop
   godloop init [-api https://godloop.ai] [-workspace name]
   godloop login [-api https://godloop.ai] [-name machine]
-  godloop run [-agent codex|claude] [-workdir .] [-codex-sandbox workspace-write] [-danger]
+  godloop run [-agent codex|claude] [-workdir .] [-codex-sandbox danger-full-access] [-danger]
   godloop status [-api https://godloop.ai] [-key glp_...]
   godloop usage
   godloop once -project <id> [-env name] [-sub id] [-agent codex|claude] [-workdir .] [-danger]
@@ -375,7 +375,7 @@ func runDaemon(args []string) error {
 	agent := fs.String("agent", "", "codex or claude; defaults to selected sub provider, then codex")
 	agentCommand := fs.String("agent-command", "", "provider command prefix; overrides the selected sub runner command")
 	workdir := fs.String("workdir", ".", "repo directory")
-	codexSandbox := fs.String("codex-sandbox", "workspace-write", "Codex sandbox mode: read-only, workspace-write, or danger-full-access")
+	codexSandbox := fs.String("codex-sandbox", "danger-full-access", "Codex sandbox mode: read-only, workspace-write, or danger-full-access")
 	danger := fs.Bool("danger", false, "use provider bypass/danger mode; run inside a container")
 	subID := fs.Int64("sub", 0, "AI sub id to charge usage against")
 	maxPromptChars := fs.Int("max-prompt-chars", 8000, "max prompt chars to request")
@@ -567,7 +567,7 @@ func once(args []string) error {
 	agent := fs.String("agent", "", "codex or claude; defaults to selected sub provider, then codex")
 	agentCommand := fs.String("agent-command", "", "provider command prefix; overrides the selected sub runner command")
 	workdir := fs.String("workdir", ".", "repo directory")
-	codexSandbox := fs.String("codex-sandbox", "workspace-write", "Codex sandbox mode: read-only, workspace-write, or danger-full-access")
+	codexSandbox := fs.String("codex-sandbox", "danger-full-access", "Codex sandbox mode: read-only, workspace-write, or danger-full-access")
 	danger := fs.Bool("danger", false, "use provider bypass/danger mode; run inside a container")
 	subID := fs.Int64("sub", 0, "AI sub id to charge usage against")
 	maxPromptChars := fs.Int("max-prompt-chars", 8000, "max prompt chars to request")
@@ -758,7 +758,7 @@ func runAgent(agent, command, workdir, prompt, codexSandbox string, danger bool,
 func cleanCodexSandbox(mode string) (string, error) {
 	mode = strings.TrimSpace(mode)
 	if mode == "" {
-		return "workspace-write", nil
+		return "danger-full-access", nil
 	}
 	switch mode {
 	case "read-only", "workspace-write", "danger-full-access":

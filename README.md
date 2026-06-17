@@ -60,19 +60,22 @@ work queued from the dashboard and checks for new work about every 10 seconds.
 It uses outbound HTTPS with your runner key; the service does not SSH into your
 machine.
 
-For unattended provider bypass modes, run inside Docker/devcontainer or another
-isolated environment:
+By default, Codex runs with `--sandbox danger-full-access` so local shell tools
+work on hosts where Codex's bubblewrap sandbox cannot create network namespaces.
+Run godloop only in repos and machines you trust, or put the whole runner inside
+Docker/devcontainer.
+
+For provider bypass modes, use `-danger` only inside Docker/devcontainer or
+another isolated environment:
 
 ```bash
 godloop run -agent codex -workdir /path/to/repo -danger
 ```
 
-If Codex reports a local sandbox error such as `bwrap: loopback: Failed
-RTM_NEWADDR`, keep godloop in foreground but ask Codex to use its full-access
-sandbox mode:
+If you want Codex's stricter sandbox and your host supports it, opt back in:
 
 ```bash
-godloop run -agent codex -workdir /path/to/repo -codex-sandbox danger-full-access
+godloop run -agent codex -workdir /path/to/repo -codex-sandbox workspace-write
 ```
 
 While a prompt is running, the CLI tees provider output to your terminal and
