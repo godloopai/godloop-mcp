@@ -15,7 +15,7 @@ With Go:
 
 ```bash
 go install github.com/godloopai/godloop-mcp/cmd/godloop@latest
-godloop login
+godloop
 ```
 
 This does not require `sudo`. It drops `godloop` into `$(go env GOPATH)/bin` —
@@ -50,25 +50,34 @@ xattr -d com.apple.quarantine "$HOME/.local/bin/godloop"
 ## Use the runner
 
 ```bash
-godloop login
-godloop status
-godloop once -project <project-id> -agent codex -workdir /path/to/repo
+godloop
+godloop run
 ```
+
+`godloop` opens browser login if needed, shows your available workspaces, and
+lets you choose or create one. `godloop run` keeps this machine available for
+work queued from the dashboard. It uses outbound HTTPS with your runner key; the
+service does not SSH into your machine.
 
 For unattended provider bypass modes, run inside Docker/devcontainer or another
 isolated environment:
 
 ```bash
-godloop once -project <project-id> -agent codex -workdir /path/to/repo -danger
+godloop run -agent codex -workdir /path/to/repo -danger
 ```
 
 While a prompt is running, the CLI tees provider output to your terminal and
 sends bounded progress summaries back to godloop every 20 seconds. Use
 `-progress-interval 0` to disable live progress reports for a run.
 
-`godloop login` opens a browser approval URL and stores the machine credential
-in your user config directory. The dashboard shows this as a connected machine,
-not as a key you have to copy around.
+Advanced/manual commands are still available:
+
+```bash
+godloop login
+godloop status
+godloop once -project <project-id> -agent codex -workdir /path/to/repo
+godloop loop -project <project-id> -workdir /path/to/repo
+```
 
 ## Install the MCP connector
 

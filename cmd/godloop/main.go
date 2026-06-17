@@ -12,10 +12,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -45,22 +47,32 @@ type runnerSession struct {
 }
 
 type runnerStatus struct {
-	ServerTime  int64         `json:"server_time"`
-	Projects    []project     `json:"projects"`
-	Subs        []subUsage    `json:"subs"`
-	CurrentWork []currentWork `json:"current_work"`
+	ServerTime   int64         `json:"server_time"`
+	Projects     []project     `json:"projects"`
+	Environments []environment `json:"environments"`
+	Subs         []subUsage    `json:"subs"`
+	CurrentWork  []currentWork `json:"current_work"`
 }
 
 type project struct {
-	ID   string `json:"id"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	EnvironmentID *int64 `json:"environment_id"`
+}
+
+type environment struct {
+	ID   int64  `json:"id"`
 	Name string `json:"name"`
+	Kind string `json:"kind"`
 }
 
 type subUsage struct {
 	ID                    int64  `json:"id"`
 	Name                  string `json:"name"`
+	Provider              string `json:"provider"`
 	Type                  string `json:"type"`
 	Status                string `json:"status"`
+	RunnerCommand         string `json:"runner_command"`
 	EstTokensUsed         int64  `json:"est_tokens_used"`
 	WeeklyTokenAllowance  int64  `json:"weekly_token_allowance"`
 	ResetAt               int64  `json:"reset_at"`
@@ -81,14 +93,15 @@ type currentWork struct {
 }
 
 type loopResponse struct {
-	EnvironmentID   int64     `json:"environment_id"`
-	Action          string    `json:"action"` // work | idle | backoff
-	Reason          string    `json:"reason"`
-	Task            *loopTask `json:"task"`
-	NextCallSeconds int64     `json:"next_call_seconds"`
-	ServerTime      int64     `json:"server_time"`
-	MaxPromptChars  int       `json:"max_prompt_chars"`
-	ContextHint     string    `json:"context_budget_hint"`
+	EnvironmentID   int64      `json:"environment_id"`
+	Action          string     `json:"action"` // work | idle | backoff
+	Reason          string     `json:"reason"`
+	Task            *loopTask  `json:"task"`
+	Subs            []subUsage `json:"subs"`
+	NextCallSeconds int64      `json:"next_call_seconds"`
+	ServerTime      int64      `json:"server_time"`
+	MaxPromptChars  int        `json:"max_prompt_chars"`
+	ContextHint     string     `json:"context_budget_hint"`
 }
 
 type loopTask struct {
@@ -117,23 +130,28 @@ type reportPayload struct {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		usageAndExit()
-	}
 	var err error
-	switch os.Args[1] {
-	case "login", "connect":
-		err = login(os.Args[2:])
-	case "status", "usage":
-		err = status(os.Args[2:])
-	case "once":
-		err = once(os.Args[2:])
-	case "loop":
-		err = loopInteractive(os.Args[2:])
-	case "logout":
-		err = logout()
-	default:
-		usageAndExit()
+	if len(os.Args) < 2 {
+		err = initCommand(nil)
+	} else {
+		switch os.Args[1] {
+		case "init":
+			err = initCommand(os.Args[2:])
+		case "login", "connect":
+			err = login(os.Args[2:])
+		case "status", "usage":
+			err = status(os.Args[2:])
+		case "run", "daemon":
+			err = runDaemon(os.Args[2:])
+		case "once":
+			err = once(os.Args[2:])
+		case "loop":
+			err = loopInteractive(os.Args[2:])
+		case "logout":
+			err = logout()
+		default:
+			usageAndExit()
+		}
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -143,13 +161,121 @@ func main() {
 
 func usageAndExit() {
 	fmt.Fprintln(os.Stderr, `usage:
+  godloop
+  godloop init [-api https://godloop.ai] [-workspace name]
   godloop login [-api https://godloop.ai] [-name machine]
+  godloop run [-agent codex|claude] [-workdir .] [-danger]
   godloop status [-api https://godloop.ai] [-key glp_...]
   godloop usage
-  godloop once -project <id> [-env name] [-agent codex|claude] [-workdir .] [-danger]
+  godloop once -project <id> [-env name] [-sub id] [-agent codex|claude] [-workdir .] [-danger]
   godloop loop -project <id> [-workdir .] [-quiet 8s] [-danger]   # persistent interactive Claude session
   godloop logout`)
 	os.Exit(2)
+}
+
+func initCommand(args []string) error {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	apiURL := fs.String("api", "", "godloop API URL")
+	key := fs.String("key", "", "godloop runner key")
+	workspace := fs.String("workspace", "", "workspace name to use or create")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, _ := loadConfig()
+	if *apiURL == "" {
+		*apiURL = firstNonEmpty(cfg.APIURL, envOrDefault("GODLOOP_API_URL", defaultAPIURL))
+	}
+	if *key == "" {
+		*key = firstNonEmpty(os.Getenv("GODLOOP_KEY"), cfg.Key)
+	}
+	if *key == "" {
+		fmt.Println("No godloop runner login found. Opening browser login first.")
+		loginArgs := []string{"-api", *apiURL, "-name", firstNonEmpty(*workspace, cfg.Machine, hostname())}
+		if err := login(loginArgs); err != nil {
+			return err
+		}
+		cfg, _ = loadConfig()
+		*key = cfg.Key
+		*apiURL = firstNonEmpty(cfg.APIURL, *apiURL)
+		if *key == "" {
+			return errors.New("login completed but no runner key was saved")
+		}
+	}
+
+	var st runnerStatus
+	if err := apiRequest(context.Background(), "GET", *apiURL, "/api/v1/runner/status", *key, nil, &st); err != nil {
+		return err
+	}
+	name, err := chooseWorkspace(context.Background(), *apiURL, *key, cfg, st.Environments, *workspace, os.Stdin, os.Stdout)
+	if err != nil {
+		return err
+	}
+	cfg.APIURL = strings.TrimRight(*apiURL, "/")
+	cfg.Key = *key
+	cfg.Machine = name
+	if err := saveConfig(cfg); err != nil {
+		return err
+	}
+	fmt.Println("Ready. Add work in the dashboard; this machine is connected as:", name)
+	fmt.Println("Keep it running with: godloop run")
+	return nil
+}
+
+func chooseWorkspace(ctx context.Context, apiURL, key string, cfg config, envs []environment, requested string, in io.Reader, out io.Writer) (string, error) {
+	requested = strings.TrimSpace(requested)
+	if requested != "" {
+		if env := findEnvironmentByName(envs, requested); env != nil {
+			return env.Name, nil
+		}
+		return createRunnerWorkspace(ctx, apiURL, key, requested)
+	}
+	if cfg.Machine != "" {
+		if env := findEnvironmentByName(envs, cfg.Machine); env != nil {
+			fmt.Fprintf(out, "Using workspace: %s\n", env.Name)
+			return env.Name, nil
+		}
+	}
+	if len(envs) == 0 {
+		name := firstNonEmpty(cfg.Machine, hostname())
+		fmt.Fprintf(out, "Creating workspace: %s\n", name)
+		return createRunnerWorkspace(ctx, apiURL, key, name)
+	}
+
+	fmt.Fprintln(out, "Choose a workspace:")
+	for i, env := range envs {
+		fmt.Fprintf(out, "  %d. %s (%s)\n", i+1, env.Name, env.Kind)
+	}
+	fmt.Fprint(out, "Workspace number, or type a new name: ")
+	line, _ := bufio.NewReader(in).ReadString('\n')
+	choice := strings.TrimSpace(line)
+	if choice == "" {
+		return envs[0].Name, nil
+	}
+	if n, err := strconv.Atoi(choice); err == nil {
+		if n < 1 || n > len(envs) {
+			return "", fmt.Errorf("workspace choice %d out of range", n)
+		}
+		return envs[n-1].Name, nil
+	}
+	return createRunnerWorkspace(ctx, apiURL, key, choice)
+}
+
+func findEnvironmentByName(envs []environment, name string) *environment {
+	for i := range envs {
+		if strings.EqualFold(strings.TrimSpace(envs[i].Name), strings.TrimSpace(name)) {
+			return &envs[i]
+		}
+	}
+	return nil
+}
+
+func createRunnerWorkspace(ctx context.Context, apiURL, key, name string) (string, error) {
+	var created environment
+	if err := apiRequest(ctx, "POST", apiURL, "/api/v1/runner/environments", key, map[string]string{"name": name}, &created); err != nil {
+		return "", err
+	}
+	return created.Name, nil
 }
 
 func login(args []string) error {
@@ -175,8 +301,10 @@ func login(args []string) error {
 		interval = 2 * time.Second
 	}
 	deadline := time.Now().Add(*timeout)
-	for time.Now().Before(deadline) {
-		time.Sleep(interval)
+	for {
+		if time.Now().After(deadline) {
+			break
+		}
 		var polled runnerSession
 		if err := apiRequest(context.Background(), "GET", *apiURL, "/api/v1/runner/sessions/"+created.Code, "", nil, &polled); err != nil {
 			return err
@@ -199,6 +327,14 @@ func login(args []string) error {
 		case "consumed":
 			return errors.New("pairing code was already consumed")
 		}
+		sleep := interval
+		if remaining := time.Until(deadline); remaining < sleep {
+			sleep = remaining
+		}
+		if sleep <= 0 {
+			break
+		}
+		time.Sleep(sleep)
 	}
 	return errors.New("timed out waiting for approval")
 }
@@ -229,6 +365,195 @@ func status(args []string) error {
 	return nil
 }
 
+func runDaemon(args []string) error {
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	apiURL := fs.String("api", "", "godloop API URL")
+	key := fs.String("key", "", "godloop runner key")
+	workspace := fs.String("workspace", "", "workspace name (defaults to the one you connected)")
+	kind := fs.String("kind", "local", "workspace kind")
+	agent := fs.String("agent", "", "codex or claude; defaults to selected sub provider, then codex")
+	agentCommand := fs.String("agent-command", "", "provider command prefix; overrides the selected sub runner command")
+	workdir := fs.String("workdir", ".", "repo directory")
+	danger := fs.Bool("danger", false, "use provider bypass/danger mode; run inside a container")
+	subID := fs.Int64("sub", 0, "AI sub id to charge usage against")
+	maxPromptChars := fs.Int("max-prompt-chars", 8000, "max prompt chars to request")
+	progressInterval := fs.Duration("progress-interval", 20*time.Second, "how often to send live progress while an agent runs")
+	poll := fs.Duration("poll", time.Minute, "minimum idle poll interval")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, _ := loadConfig()
+	if *apiURL == "" {
+		*apiURL = firstNonEmpty(cfg.APIURL, envOrDefault("GODLOOP_API_URL", defaultAPIURL))
+	}
+	if *key == "" {
+		*key = firstNonEmpty(os.Getenv("GODLOOP_KEY"), cfg.Key)
+	}
+	if *key == "" {
+		fmt.Println("No godloop runner login found. Opening browser login first.")
+		if err := initCommand([]string{"-api", *apiURL, "-workspace", firstNonEmpty(*workspace, cfg.Machine, hostname())}); err != nil {
+			return err
+		}
+		cfg, _ = loadConfig()
+		*key = cfg.Key
+		*apiURL = firstNonEmpty(cfg.APIURL, *apiURL)
+	}
+	if strings.TrimSpace(*workspace) == "" {
+		*workspace = firstNonEmpty(cfg.Machine, hostname())
+	}
+	if *poll < 10*time.Second {
+		*poll = 10 * time.Second
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var reportSubID *int64
+	if *subID > 0 {
+		reportSubID = subID
+	}
+	fmt.Println("godloop runner online:", *workspace)
+	for ctx.Err() == nil {
+		next, worked, err := runDaemonTick(ctx, *apiURL, *key, *workspace, clean(*kind), *agent, *agentCommand, *workdir, *danger, reportSubID, *maxPromptChars, *progressInterval)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "warning:", err)
+			next = *poll
+		}
+		if worked {
+			continue
+		}
+		if next <= 0 || next > *poll {
+			next = *poll
+		}
+		if sleepOrDone(ctx, next) {
+			return nil
+		}
+	}
+	return nil
+}
+
+func runDaemonTick(ctx context.Context, apiURL, key, workspace, kind, agent, agentCommand, workdir string, danger bool, subID *int64, maxPromptChars int, progressInterval time.Duration) (time.Duration, bool, error) {
+	var st runnerStatus
+	if err := apiRequest(ctx, "GET", apiURL, "/api/v1/runner/status", key, nil, &st); err != nil {
+		return 0, false, err
+	}
+	env := findEnvironmentByName(st.Environments, workspace)
+	if env == nil {
+		return 0, false, fmt.Errorf("workspace %q not found; run godloop init", workspace)
+	}
+	projects := projectsForWorkspace(st.Projects, env.ID)
+	if len(projects) == 0 {
+		fmt.Println("No projects assigned to this workspace yet.")
+		return time.Minute, false, nil
+	}
+
+	var next time.Duration
+	for _, project := range projects {
+		loop, err := callProjectLoop(ctx, apiURL, key, project.ID, workspace, kind, subID, maxPromptChars)
+		if err != nil {
+			return 0, false, err
+		}
+		if loop.NextCallSeconds > 0 {
+			d := time.Duration(loop.NextCallSeconds) * time.Second
+			if next == 0 || d < next {
+				next = d
+			}
+		}
+		if loop.Action == "work" && loop.Task != nil {
+			fmt.Printf("Running %s: #%d %s\n", project.Name, loop.Task.ID, loop.Task.Title)
+			return next, true, runLoopTask(ctx, apiURL, key, loop, subID, agent, agentCommand, workdir, danger, progressInterval)
+		}
+	}
+	if next == 0 {
+		next = time.Minute
+	}
+	return next, false, nil
+}
+
+func projectsForWorkspace(projects []project, envID int64) []project {
+	out := make([]project, 0, len(projects))
+	for _, project := range projects {
+		if project.EnvironmentID == nil || *project.EnvironmentID == envID {
+			out = append(out, project)
+		}
+	}
+	return out
+}
+
+func callProjectLoop(ctx context.Context, apiURL, key, projectID, workspace, kind string, subID *int64, maxPromptChars int) (loopResponse, error) {
+	body := map[string]any{
+		"project_id":       strings.TrimSpace(projectID),
+		"name":             clean(workspace),
+		"kind":             clean(kind),
+		"max_prompt_chars": maxPromptChars,
+	}
+	if subID != nil {
+		body["ai_sub_id"] = *subID
+	}
+	var loop loopResponse
+	err := apiRequest(ctx, "POST", apiURL, "/api/v1/mcp/loop", key, body, &loop)
+	return loop, err
+}
+
+func runLoopTask(ctx context.Context, apiURL, key string, loop loopResponse, reportSubID *int64, agent, agentCommand, workdir string, danger bool, progressInterval time.Duration) error {
+	if loop.Task == nil {
+		return nil
+	}
+	selectedSub := findSub(loop.Subs, derefInt64(reportSubID))
+	if reportSubID != nil && selectedSub == nil {
+		return fmt.Errorf("selected AI sub #%d was not returned by the server", *reportSubID)
+	}
+	agentName := cleanAgentName(agent, selectedSub)
+	command := strings.TrimSpace(agentCommand)
+	if command == "" && selectedSub != nil {
+		command = strings.TrimSpace(selectedSub.RunnerCommand)
+	}
+
+	taskID := loop.Task.ID
+	progress := func(tail string) {
+		if strings.TrimSpace(tail) == "" {
+			tail = "Agent is still running."
+		}
+		pctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := sendReport(pctx, apiURL, key, reportPayload{
+			EnvironmentID: loop.EnvironmentID,
+			TaskID:        &taskID,
+			AISubID:       reportSubID,
+			Outcome:       "progress",
+			Summary:       summarizeOutput(tail),
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: failed to report progress:", err)
+		}
+	}
+
+	stream := startSessionStream(apiURL, key, loop.EnvironmentID, loop.Task.ProjectID, taskID, loop.Task.Title)
+	defer stream.close()
+	out, use, runErr := runAgent(agentName, command, workdir, loop.Task.Prompt, danger, progressInterval, progress, stream.write)
+	outcome := "done"
+	if runErr != nil {
+		outcome = "error"
+	}
+	summary := summarizeOutput(out)
+	if err := sendReport(ctx, apiURL, key, reportPayload{
+		EnvironmentID: loop.EnvironmentID,
+		TaskID:        &taskID,
+		AISubID:       reportSubID,
+		Outcome:       outcome,
+		Summary:       summary,
+		InputTokens:   use.Input,
+		OutputTokens:  use.Output,
+	}); err != nil {
+		return err
+	}
+	if runErr != nil {
+		return runErr
+	}
+	fmt.Println(summary)
+	return nil
+}
+
 func once(args []string) error {
 	fs := flag.NewFlagSet("once", flag.ExitOnError)
 	apiURL := fs.String("api", "", "godloop API URL")
@@ -236,7 +561,8 @@ func once(args []string) error {
 	projectID := fs.String("project", "", "project id from godloop")
 	envName := fs.String("env", "", "workspace name (defaults to the one you connected)")
 	kind := fs.String("kind", "local", "environment kind")
-	agent := fs.String("agent", "codex", "codex or claude")
+	agent := fs.String("agent", "", "codex or claude; defaults to selected sub provider, then codex")
+	agentCommand := fs.String("agent-command", "", "provider command prefix; overrides the selected sub runner command")
 	workdir := fs.String("workdir", ".", "repo directory")
 	danger := fs.Bool("danger", false, "use provider bypass/danger mode; run inside a container")
 	subID := fs.Int64("sub", 0, "AI sub id to charge usage against")
@@ -262,23 +588,22 @@ func once(args []string) error {
 		*envName = firstNonEmpty(cfg.Machine, hostname())
 	}
 
-	body := map[string]any{
-		"project_id":       strings.TrimSpace(*projectID),
-		"name":             clean(*envName),
-		"kind":             clean(*kind),
-		"max_prompt_chars": *maxPromptChars,
-	}
+	var reportSubID *int64
 	if *subID > 0 {
-		body["ai_sub_id"] = *subID
+		reportSubID = subID
 	}
-	var loop loopResponse
-	if err := apiRequest(context.Background(), "POST", *apiURL, "/api/v1/mcp/loop", *key, body, &loop); err != nil {
+	loop, err := callProjectLoop(context.Background(), *apiURL, *key, *projectID, *envName, *kind, reportSubID, *maxPromptChars)
+	if err != nil {
 		return err
 	}
-	// The server decides the move from usage: work (run it), idle (stand by),
-	// backoff (near a usage limit — wait longer).
 	if loop.Action != "work" || loop.Task == nil {
-		fmt.Printf("%s — %s\n", strings.ToUpper(loop.Action), loop.Reason)
+		if loop.Action == "" {
+			loop.Action = "idle"
+		}
+		if loop.Reason == "" {
+			loop.Reason = "no work queued"
+		}
+		fmt.Printf("%s - %s\n", strings.ToUpper(loop.Action), loop.Reason)
 		fmt.Printf("Next check: %s\n", time.Duration(loop.NextCallSeconds)*time.Second)
 		return nil
 	}
@@ -286,53 +611,7 @@ func once(args []string) error {
 	if loop.Task.PromptTruncated {
 		fmt.Println("Prompt was truncated by server max_prompt_chars.")
 	}
-
-	taskID := loop.Task.ID
-	var reportSubID *int64
-	if *subID > 0 {
-		reportSubID = subID
-	}
-	progress := func(tail string) {
-		if strings.TrimSpace(tail) == "" {
-			tail = "Agent is still running."
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := sendReport(ctx, *apiURL, *key, reportPayload{
-			EnvironmentID: loop.EnvironmentID,
-			TaskID:        &taskID,
-			AISubID:       reportSubID,
-			Outcome:       "progress",
-			Summary:       summarizeOutput(tail),
-		}); err != nil {
-			fmt.Fprintln(os.Stderr, "warning: failed to report progress:", err)
-		}
-	}
-
-	stream := startSessionStream(*apiURL, *key, loop.EnvironmentID, loop.Task.ProjectID, taskID, loop.Task.Title)
-	defer stream.close()
-	out, use, runErr := runAgent(*agent, *workdir, loop.Task.Prompt, *danger, *progressInterval, progress, stream.write)
-	outcome := "done"
-	if runErr != nil {
-		outcome = "error"
-	}
-	summary := summarizeOutput(out)
-	if err := sendReport(context.Background(), *apiURL, *key, reportPayload{
-		EnvironmentID: loop.EnvironmentID,
-		TaskID:        &taskID,
-		AISubID:       reportSubID,
-		Outcome:       outcome,
-		Summary:       summary,
-		InputTokens:   use.Input,
-		OutputTokens:  use.Output,
-	}); err != nil {
-		return err
-	}
-	if runErr != nil {
-		return runErr
-	}
-	fmt.Println(summary)
-	return nil
+	return runLoopTask(context.Background(), *apiURL, *key, loop, reportSubID, *agent, *agentCommand, *workdir, *danger, *progressInterval)
 }
 
 func sendReport(ctx context.Context, apiURL, key string, report reportPayload) error {
@@ -350,6 +629,36 @@ func logout() error {
 	}
 	fmt.Println("Logged out.")
 	return nil
+}
+
+func findSub(subs []subUsage, id int64) *subUsage {
+	if id <= 0 {
+		return nil
+	}
+	for i := range subs {
+		if subs[i].ID == id {
+			return &subs[i]
+		}
+	}
+	return nil
+}
+
+func derefInt64(v *int64) int64 {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
+func cleanAgentName(agent string, sub *subUsage) string {
+	agent = strings.ToLower(strings.TrimSpace(agent))
+	if agent != "" {
+		return agent
+	}
+	if sub != nil && strings.TrimSpace(sub.Provider) != "" {
+		return strings.ToLower(strings.TrimSpace(sub.Provider))
+	}
+	return "codex"
 }
 
 // sessionStreamer mirrors the agent's terminal output to godloop so the
@@ -413,7 +722,7 @@ func (s *sessionStreamer) close() {
 	s.post("/api/v1/sessions/"+s.id+"/close", nil)
 }
 
-func runAgent(agent, workdir, prompt string, danger bool, progressInterval time.Duration, progress func(string), stream func([]byte)) (string, usage, error) {
+func runAgent(agent, command, workdir, prompt string, danger bool, progressInterval time.Duration, progress func(string), stream func([]byte)) (string, usage, error) {
 	switch strings.ToLower(agent) {
 	case "codex":
 		args := []string{"exec", "--cd", workdir, "--json"}
@@ -423,7 +732,7 @@ func runAgent(agent, workdir, prompt string, danger bool, progressInterval time.
 			args = append(args, "--sandbox", "workspace-write")
 		}
 		args = append(args, prompt)
-		return runCommand("codex", args, progressInterval, progress, stream)
+		return runProviderCommand("codex", command, args, progressInterval, progress, stream)
 	case "claude":
 		args := []string{"-p", "--output-format", "json"}
 		if danger {
@@ -432,10 +741,25 @@ func runAgent(agent, workdir, prompt string, danger bool, progressInterval time.
 			args = append(args, "--permission-mode", "auto")
 		}
 		args = append(args, prompt)
-		return runCommand("claude", args, progressInterval, progress, stream)
+		return runProviderCommand("claude", command, args, progressInterval, progress, stream)
 	default:
 		return "", usage{}, fmt.Errorf("unknown agent %q", agent)
 	}
+}
+
+func runProviderCommand(defaultName, command string, args []string, progressInterval time.Duration, progress func(string), stream func([]byte)) (string, usage, error) {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return runCommand(defaultName, args, progressInterval, progress, stream)
+	}
+	return runShellCommand(command, args, progressInterval, progress, stream)
+}
+
+func runShellCommand(command string, args []string, progressInterval time.Duration, progress func(string), stream func([]byte)) (string, usage, error) {
+	shell := envOrDefault("SHELL", "/bin/sh")
+	shellArgs := []string{"-c", command + ` "$@"`, command}
+	shellArgs = append(shellArgs, args...)
+	return runCommand(shell, shellArgs, progressInterval, progress, stream)
 }
 
 func runCommand(name string, args []string, progressInterval time.Duration, progress func(string), stream func([]byte)) (string, usage, error) {
@@ -659,6 +983,9 @@ func printStatus(st runnerStatus) {
 			reset = " · reset " + distance(st.ServerTime, sub.ResetAt)
 		}
 		fmt.Printf("  #%d %s (%s): %s%s\n", sub.ID, sub.Name, sub.Type, left, reset)
+		if strings.TrimSpace(sub.RunnerCommand) != "" {
+			fmt.Println("    runner command configured")
+		}
 	}
 	fmt.Println()
 	fmt.Println("Current work")
