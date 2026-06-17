@@ -675,15 +675,13 @@ type sessionStreamer struct {
 
 func startSessionStream(apiURL, key string, envID int64, projectID string, taskID int64, title string) *sessionStreamer {
 	var created struct {
-		Data struct {
-			ID string `json:"id"`
-		} `json:"data"`
+		ID string `json:"id"`
 	}
 	body := map[string]any{"environment_id": envID, "project_id": projectID, "task_id": taskID, "title": title}
-	if err := apiRequest(context.Background(), "POST", apiURL, "/api/v1/sessions", key, body, &created); err != nil || created.Data.ID == "" {
+	if err := apiRequest(context.Background(), "POST", apiURL, "/api/v1/sessions", key, body, &created); err != nil || created.ID == "" {
 		return nil
 	}
-	s := &sessionStreamer{apiURL: apiURL, key: key, id: created.Data.ID, ch: make(chan []byte, 256), done: make(chan struct{})}
+	s := &sessionStreamer{apiURL: apiURL, key: key, id: created.ID, ch: make(chan []byte, 256), done: make(chan struct{})}
 	go func() {
 		defer close(s.done)
 		for chunk := range s.ch {
@@ -969,13 +967,22 @@ func apiRequest[T any](ctx context.Context, method, apiURL, path, key string, bo
 		return err
 	}
 	defer resp.Body.Close()
-	var env apiEnvelope[T]
-	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return err
+	}
+	var env apiEnvelope[T]
+	if len(strings.TrimSpace(string(raw))) > 0 {
+		if err := json.Unmarshal(raw, &env); err != nil {
+			return err
+		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if env.Message != "" {
 			return errors.New(env.Message)
+		}
+		if len(strings.TrimSpace(string(raw))) > 0 {
+			return fmt.Errorf("request failed: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
 		}
 		return fmt.Errorf("request failed: %s", resp.Status)
 	}

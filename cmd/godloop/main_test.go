@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func withTempConfig(t *testing.T) string {
@@ -118,6 +120,74 @@ func TestOnceUsesSavedWorkspaceAndHonorsIdleAction(t *testing.T) {
 	}
 	if reported {
 		t.Fatal("once reported a result even though the server action was backoff")
+	}
+}
+
+func TestRunLoopTaskStreamsLiveSessionOutput(t *testing.T) {
+	var started struct {
+		EnvironmentID int64  `json:"environment_id"`
+		ProjectID     string `json:"project_id"`
+		TaskID        int64  `json:"task_id"`
+		Title         string `json:"title"`
+	}
+	var appended bytes.Buffer
+	closed := false
+	reported := false
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Godloop-Key") != "glp_test" {
+			t.Fatalf("runner key = %q, want glp_test", r.Header.Get("X-Godloop-Key"))
+		}
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions":
+			if err := json.NewDecoder(r.Body).Decode(&started); err != nil {
+				t.Fatal(err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": "sess1"}})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions/sess1/append":
+			if _, err := io.Copy(&appended, r.Body); err != nil {
+				t.Fatal(err)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions/sess1/close":
+			closed = true
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/mcp/report":
+			reported = true
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	err := runLoopTask(context.Background(), server.URL, "glp_test", loopResponse{
+		EnvironmentID: 7,
+		Task: &loopTask{
+			ID:        42,
+			ProjectID: "proj",
+			Title:     "stream me",
+			Prompt:    "ignored",
+		},
+	}, nil, "codex", "printf live-output; :", ".", "danger-full-access", false, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.EnvironmentID != 7 || started.ProjectID != "proj" || started.TaskID != 42 {
+		t.Fatalf("live session start = %+v, want env 7 project proj task 42", started)
+	}
+	if !strings.Contains(started.Title, "stream me") {
+		t.Fatalf("live session title = %q, want task title", started.Title)
+	}
+	if got := appended.String(); got != "live-output" {
+		t.Fatalf("streamed output = %q, want live-output", got)
+	}
+	if !closed {
+		t.Fatal("live session was not closed")
+	}
+	if !reported {
+		t.Fatal("task result was not reported")
 	}
 }
 

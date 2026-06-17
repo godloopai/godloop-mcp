@@ -14,7 +14,7 @@ This repo ships two binaries:
 With Go:
 
 ```bash
-go install github.com/godloopai/godloop-mcp/cmd/godloop@latest
+go install github.com/godloopai/godloop-mcp/cmd/godloop@v0.3.11-alpha
 godloop
 ```
 
