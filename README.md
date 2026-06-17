@@ -56,8 +56,9 @@ godloop run
 
 `godloop` opens browser login if needed, shows your available workspaces, and
 lets you choose or create one. `godloop run` keeps this machine available for
-work queued from the dashboard. It uses outbound HTTPS with your runner key; the
-service does not SSH into your machine.
+work queued from the dashboard and checks for new work about every 10 seconds.
+It uses outbound HTTPS with your runner key; the service does not SSH into your
+machine.
 
 For unattended provider bypass modes, run inside Docker/devcontainer or another
 isolated environment:

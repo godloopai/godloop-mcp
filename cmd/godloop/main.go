@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -378,7 +379,7 @@ func runDaemon(args []string) error {
 	subID := fs.Int64("sub", 0, "AI sub id to charge usage against")
 	maxPromptChars := fs.Int("max-prompt-chars", 8000, "max prompt chars to request")
 	progressInterval := fs.Duration("progress-interval", 20*time.Second, "how often to send live progress while an agent runs")
-	poll := fs.Duration("poll", time.Minute, "minimum idle poll interval")
+	poll := fs.Duration("poll", 10*time.Second, "minimum idle poll interval")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -402,8 +403,8 @@ func runDaemon(args []string) error {
 	if strings.TrimSpace(*workspace) == "" {
 		*workspace = firstNonEmpty(cfg.Machine, hostname())
 	}
-	if *poll < 10*time.Second {
-		*poll = 10 * time.Second
+	if *poll < 2*time.Second {
+		*poll = 2 * time.Second
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -435,7 +436,8 @@ func runDaemon(args []string) error {
 
 func runDaemonTick(ctx context.Context, apiURL, key, workspace, kind, agent, agentCommand, workdir string, danger bool, subID *int64, maxPromptChars int, progressInterval time.Duration) (time.Duration, bool, error) {
 	var st runnerStatus
-	if err := apiRequest(ctx, "GET", apiURL, "/api/v1/runner/status", key, nil, &st); err != nil {
+	statusPath := "/api/v1/runner/status?workspace=" + url.QueryEscape(workspace) + "&kind=" + url.QueryEscape(kind)
+	if err := apiRequest(ctx, "GET", apiURL, statusPath, key, nil, &st); err != nil {
 		return 0, false, err
 	}
 	env := findEnvironmentByName(st.Environments, workspace)
