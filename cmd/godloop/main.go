@@ -121,13 +121,16 @@ type usage struct {
 }
 
 type reportPayload struct {
-	EnvironmentID int64  `json:"environment_id"`
-	TaskID        *int64 `json:"task_id,omitempty"`
-	AISubID       *int64 `json:"ai_sub_id,omitempty"`
-	Outcome       string `json:"outcome"`
-	Summary       string `json:"summary"`
-	InputTokens   int64  `json:"input_tokens"`
-	OutputTokens  int64  `json:"output_tokens"`
+	EnvironmentID  int64  `json:"environment_id"`
+	TaskID         *int64 `json:"task_id,omitempty"`
+	AISubID        *int64 `json:"ai_sub_id,omitempty"`
+	Outcome        string `json:"outcome"`
+	Summary        string `json:"summary"`
+	InputTokens    int64  `json:"input_tokens"`
+	OutputTokens   int64  `json:"output_tokens"`
+	SessionUsed    int64  `json:"session_used,omitempty"`
+	SessionLimit   int64  `json:"session_limit,omitempty"`
+	SessionResetAt int64  `json:"session_reset_at,omitempty"`
 }
 
 func main() {
@@ -539,14 +542,18 @@ func runLoopTask(ctx context.Context, apiURL, key string, loop loopResponse, rep
 		outcome = "error"
 	}
 	summary := summarizeOutput(out)
+	sessionUsed, sessionReset := measureSession()
 	if err := sendReport(ctx, apiURL, key, reportPayload{
-		EnvironmentID: loop.EnvironmentID,
-		TaskID:        &taskID,
-		AISubID:       reportSubID,
-		Outcome:       outcome,
-		Summary:       summary,
-		InputTokens:   use.Input,
-		OutputTokens:  use.Output,
+		EnvironmentID:  loop.EnvironmentID,
+		TaskID:         &taskID,
+		AISubID:        reportSubID,
+		Outcome:        outcome,
+		Summary:        summary,
+		InputTokens:    use.Input,
+		OutputTokens:   use.Output,
+		SessionUsed:    sessionUsed,
+		SessionLimit:   sessionTokenLimit(),
+		SessionResetAt: sessionReset,
 	}); err != nil {
 		return err
 	}
@@ -621,6 +628,101 @@ func once(args []string) error {
 func sendReport(ctx context.Context, apiURL, key string, report reportPayload) error {
 	var reportResp map[string]bool
 	return apiRequest(ctx, "POST", apiURL, "/api/v1/mcp/report", key, report, &reportResp)
+}
+
+// --- live 5h session usage: parse Claude Code transcript JSONL ---
+// Claude rolls usage on a fixed 5h block whose start is a :59 boundary on a
+// UTC hour divisible by 5. We sum output_tokens from ~/.claude transcripts
+// touched within the current block so the runner's live backoff has real data.
+// Mirrors the stdio connector and scratchpad/usage_governor.py.
+
+// computeBlockStart returns the start of the fixed 5h block containing t.
+func computeBlockStart(t time.Time) time.Time {
+	u := t.UTC()
+	b := time.Date(u.Year(), u.Month(), u.Day(), u.Hour(), 59, 0, 0, time.UTC)
+	if b.After(t) {
+		b = b.Add(-time.Hour)
+	}
+	return time.Date(b.Year(), b.Month(), b.Day(), (b.Hour()/5)*5, 59, 0, 0, time.UTC)
+}
+
+// scanSessionOutput sums output_tokens from a transcript JSONL for entries at
+// or after since. Returns 0 if the file can't be opened.
+func scanSessionOutput(path string, since time.Time) int64 {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer file.Close()
+	var out int64
+	sc := bufio.NewScanner(file)
+	sc.Buffer(make([]byte, 1<<20), 8<<20)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if !bytes.Contains(line, []byte(`"usage"`)) {
+			continue
+		}
+		var entry struct {
+			Timestamp time.Time `json:"timestamp"`
+			Message   struct {
+				Usage struct {
+					OutputTokens int64 `json:"output_tokens"`
+				} `json:"usage"`
+			} `json:"message"`
+		}
+		if json.Unmarshal(line, &entry) != nil || entry.Timestamp.Before(since) {
+			continue
+		}
+		out += entry.Message.Usage.OutputTokens
+	}
+	return out
+}
+
+// measureSession returns (output tokens used in the current 5h block, block
+// reset unix). Graceful on any filesystem error: returns what it has.
+func measureSession() (used int64, resetAt int64) {
+	start := computeBlockStart(time.Now().UTC())
+	reset := start.Add(5 * time.Hour)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return 0, 0
+	}
+	root := home + "/.claude/projects"
+	dirs, err := os.ReadDir(root)
+	if err != nil {
+		return 0, reset.Unix()
+	}
+	for _, d := range dirs {
+		if !d.IsDir() {
+			continue
+		}
+		dir := root + "/" + d.Name()
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if !strings.HasSuffix(f.Name(), ".jsonl") {
+				continue
+			}
+			info, err := f.Info()
+			if err != nil || info.ModTime().Before(start) {
+				continue
+			}
+			used += scanSessionOutput(dir+"/"+f.Name(), start)
+		}
+	}
+	return used, reset.Unix()
+}
+
+// sessionTokenLimit returns the configured 5h session token allowance, or 0
+// when GODLOOP_SESSION_TOKEN_LIMIT is unset, empty, invalid, or negative.
+func sessionTokenLimit() int64 {
+	v, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("GODLOOP_SESSION_TOKEN_LIMIT")), 10, 64)
+	if err != nil || v < 0 {
+		return 0
+	}
+	return v
 }
 
 func logout() error {
