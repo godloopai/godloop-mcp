@@ -279,11 +279,14 @@ var loopTool = map[string]any{
 				"type":        "object",
 				"description": "what happened since the previous loop call",
 				"properties": map[string]any{
-					"task_id":       map[string]any{"type": "integer"},
-					"outcome":       map[string]any{"type": "string", "enum": []string{"done", "progress", "error"}},
-					"summary":       map[string]any{"type": "string", "description": "one-line result"},
-					"input_tokens":  map[string]any{"type": "integer", "description": "estimated input tokens spent"},
-					"output_tokens": map[string]any{"type": "integer", "description": "estimated output tokens spent"},
+					"task_id":          map[string]any{"type": "integer"},
+					"outcome":          map[string]any{"type": "string", "enum": []string{"done", "progress", "error"}},
+					"summary":          map[string]any{"type": "string", "description": "one-line result"},
+					"input_tokens":     map[string]any{"type": "integer", "description": "estimated input tokens spent"},
+					"output_tokens":    map[string]any{"type": "integer", "description": "estimated output tokens spent"},
+					"session_used":     map[string]any{"type": "integer", "description": "output tokens used in the current 5h provider window"},
+					"session_limit":    map[string]any{"type": "integer", "description": "the 5h output-token cap (from GODLOOP_SESSION_TOKEN_LIMIT)"},
+					"session_reset_at": map[string]any{"type": "integer", "description": "unix time the 5h window resets"},
 				},
 			},
 			"ai_sub_id": map[string]any{
@@ -324,6 +327,17 @@ func callLoop(args json.RawMessage) (string, error) {
 		}
 		in.Report["input_tokens"] = mi
 		in.Report["output_tokens"] = mo
+	}
+	// real 5h-block session usage, for backend backoff decisions
+	if su, rst := measureSession(); su > 0 {
+		if in.Report == nil {
+			in.Report = map[string]any{}
+		}
+		in.Report["session_used"] = su
+		in.Report["session_reset_at"] = rst
+		if lim := sessionTokenLimit(); lim > 0 {
+			in.Report["session_limit"] = lim
+		}
 	}
 	host, _ := os.Hostname()
 	body := map[string]any{
@@ -523,6 +537,102 @@ func scanJSONL(path string, since time.Time) (int64, int64) {
 		out += entry.Message.Usage.OutputTokens
 	}
 	return in, out
+}
+
+// --- 5h-block session usage ---
+// Providers (e.g. Claude) cap output tokens per fixed 5h window. The backend's
+// loopDecision backs off when a runner reports session_used/limit/reset_at, so
+// we compute output tokens spent in the current window from the same transcripts.
+
+// computeBlockStart returns the start of the fixed 5h block containing t: a :59
+// boundary on a UTC hour divisible by 5 (00:59, 05:59, 10:59, 15:59, 20:59 UTC).
+// Pure; mirrors the Python governor.
+func computeBlockStart(t time.Time) time.Time {
+	u := t.UTC()
+	b := time.Date(u.Year(), u.Month(), u.Day(), u.Hour(), 59, 0, 0, time.UTC)
+	if b.After(t) {
+		b = b.Add(-time.Hour)
+	}
+	// floor the hour to the nearest 5h boundary (0,5,10,15,20)
+	return time.Date(b.Year(), b.Month(), b.Day(), (b.Hour()/5)*5, 59, 0, 0, time.UTC)
+}
+
+// scanSessionOutput sums output_tokens for transcript entries at/after since.
+func scanSessionOutput(path string, since time.Time) int64 {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer file.Close()
+	var out int64
+	sc := bufio.NewScanner(file)
+	sc.Buffer(make([]byte, 1<<20), 8<<20)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if !bytes.Contains(line, []byte(`"usage"`)) {
+			continue
+		}
+		var entry struct {
+			Timestamp time.Time `json:"timestamp"`
+			Message   struct {
+				Usage struct {
+					OutputTokens int64 `json:"output_tokens"`
+				} `json:"usage"`
+			} `json:"message"`
+		}
+		if json.Unmarshal(line, &entry) != nil || entry.Timestamp.Before(since) {
+			continue
+		}
+		out += entry.Message.Usage.OutputTokens
+	}
+	return out
+}
+
+// measureSession returns (output tokens used in the current 5h block, unix time
+// the block resets). Files untouched since the block start can't hold in-block
+// entries, so they're skipped. Any FS error degrades to (0, 0) — no panic.
+func measureSession() (used int64, resetAt int64) {
+	start := computeBlockStart(time.Now().UTC())
+	reset := start.Add(5 * time.Hour)
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return 0, 0
+	}
+	dirs, err := os.ReadDir(home + "/.claude/projects")
+	if err != nil {
+		return 0, 0
+	}
+	for _, d := range dirs {
+		if !d.IsDir() {
+			continue
+		}
+		dir := home + "/.claude/projects/" + d.Name()
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if !strings.HasSuffix(f.Name(), ".jsonl") {
+				continue
+			}
+			if info, err := f.Info(); err != nil || info.ModTime().Before(start) {
+				continue // untouched since block start
+			}
+			used += scanSessionOutput(dir+"/"+f.Name(), start)
+		}
+	}
+	return used, reset.Unix()
+}
+
+// sessionTokenLimit reads the optional 5h output-token cap from the environment;
+// 0 when unset, empty, unparseable, or negative.
+func sessionTokenLimit() int64 {
+	n, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("GODLOOP_SESSION_TOKEN_LIMIT")), 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 func main() {
