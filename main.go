@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-const version = "0.3.2-alpha"
+const version = "0.4.0-alpha"
 
 const (
 	defaultMaxPromptChars = 4000
@@ -658,18 +658,28 @@ func main() {
 		case "notifications/initialized":
 			// notification, no response
 		case "tools/list":
-			reply(req.ID, map[string]any{"tools": []any{loopTool}})
+			reply(req.ID, map[string]any{"tools": []any{loopTool, loopsTool, godloopTool}})
 		case "tools/call":
 			var p struct {
 				Name      string          `json:"name"`
 				Arguments json.RawMessage `json:"arguments"`
 			}
 			json.Unmarshal(req.Params, &p)
-			if p.Name != "loop" {
+			var text string
+			var err error
+			switch p.Name {
+			case "loop":
+				text, err = callLoop(p.Arguments)
+			case "loops":
+				text, err = callLoopsTool(p.Arguments)
+			case "godloop":
+				text, err = callGodloopTool(p.Arguments)
+			default:
 				replyErr(req.ID, -32602, "unknown tool: "+p.Name)
 				continue
 			}
-			text, err := callLoop(p.Arguments)
+			// Tool failures (incl. bad actions/params) come back as tool-error
+			// TEXT, not RPC errors, so agents read them and self-correct.
 			isErr := err != nil
 			if isErr {
 				text = err.Error()

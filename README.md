@@ -14,7 +14,7 @@ This repo ships two binaries:
 With Go:
 
 ```bash
-go install github.com/godloopai/godloop-mcp/cmd/godloop@v0.3.11-alpha
+go install github.com/godloopai/godloop-mcp/cmd/godloop@v0.4.0-alpha
 godloop
 ```
 
@@ -102,9 +102,8 @@ go install github.com/godloopai/godloop-mcp@latest
 Or download `godloop-mcp_<platform>_<arch>` from
 [Releases](https://github.com/godloopai/godloop-mcp/releases).
 
-`godloop-mcp` exposes one MCP tool, `loop`. Call it at the top of every `/loop`
-tick: it reports the previous tick, returns the next task to work on, shows
-usage across your AI subs, and tells your agent when to schedule the next tick.
+`godloop-mcp` exposes three MCP tools: `loop` (the tick), `loops` (CRUD your
+loop templates), and `godloop` (compose and drive godloops) — see Tools below.
 
 ## Register with Claude Code
 
@@ -121,6 +120,25 @@ file with the project id (shown on your project's page at godloop.ai):
 ```bash
 echo '<project-id>' > .godloop
 ```
+
+## Tools
+
+- `loop` — the tick: call at the top of every /loop iteration. Reports the
+  previous tick, returns the next task, usage across your AI subs, and when
+  to call again.
+- `loops` — CRUD your loop templates (`list | get | create | update | delete`).
+  `get` an existing loop to learn the `config_json` steps shape. Visibility can
+  be set to `private`/`unlisted`; publishing to the marketplace needs the
+  dashboard.
+- `godloop` — compose and inspect godloops. Template actions
+  (`list_templates | get_template | create_template | update_template | delete_template`)
+  edit the recipe: send the full ordered `loop_template_ids` list to add,
+  remove, or reorder members. Instance actions (`list | get | reorder | trigger`)
+  drive a godloop assigned to a project: `get` returns members in order plus an
+  `active` block with the running member index and cycle number; `reorder`
+  mid-cycle lets the running loop finish and applies the new order after it.
+
+`loops` and `godloop` need the same paid `GODLOOP_KEY` as `loop`.
 
 ## Config
 
