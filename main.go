@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-const version = "0.4.0-alpha"
+const version = "0.5.0-alpha"
 
 const (
 	defaultMaxPromptChars = 4000
@@ -658,7 +658,7 @@ func main() {
 		case "notifications/initialized":
 			// notification, no response
 		case "tools/list":
-			reply(req.ID, map[string]any{"tools": []any{loopTool, loopsTool, godloopTool}})
+			reply(req.ID, map[string]any{"tools": []any{loopTool, loopsTool, godloopTool, masterplanTool}})
 		case "tools/call":
 			var p struct {
 				Name      string          `json:"name"`
@@ -674,6 +674,8 @@ func main() {
 				text, err = callLoopsTool(p.Arguments)
 			case "godloop":
 				text, err = callGodloopTool(p.Arguments)
+			case "masterplan":
+				text, err = callMasterplanTool(p.Arguments)
 			default:
 				replyErr(req.ID, -32602, "unknown tool: "+p.Name)
 				continue

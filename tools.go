@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,75 @@ import (
 	"strings"
 	"time"
 )
+
+// --- public masterplan tool ---
+
+var masterplanTool = map[string]any{
+	"name": "masterplan",
+	"description": "Add or update public items in Joe's masterplan through Godloop's scoped server-side connector. " +
+		"The tool cannot delete items, access private app data, or reveal the integration credential. " +
+		"Read https://joetann.com/api/masterplan first and pass its current revision as base_revision.",
+	"inputSchema": map[string]any{
+		"type":     "object",
+		"required": []string{"base_revision", "operations"},
+		"properties": map[string]any{
+			"base_revision": map[string]any{
+				"type":        "integer",
+				"minimum":     1,
+				"description": "Current revision from the public masterplan JSON.",
+			},
+			"idempotency_key": map[string]any{
+				"type":        "string",
+				"description": "Optional stable key for this intended change. A deterministic key is generated when omitted.",
+			},
+			"operations": map[string]any{
+				"type":     "array",
+				"minItems": 1,
+				"maxItems": 20,
+				"items": map[string]any{
+					"type":        "object",
+					"description": "Use {op:'add',node:{...}} for a full public node, or {op:'update',id:'node-id',fields:{...}}. Update fields are title, summary, goal, status, start, end, lane, progress, budget, and url. Delete, id, parent_id, and kind updates are unavailable.",
+					"properties": map[string]any{
+						"op":     map[string]any{"type": "string", "enum": []string{"add", "update"}},
+						"id":     map[string]any{"type": "string"},
+						"node":   map[string]any{"type": "object"},
+						"fields": map[string]any{"type": "object"},
+					},
+					"required": []string{"op"},
+				},
+			},
+		},
+	},
+}
+
+func callMasterplanTool(args json.RawMessage) (string, error) {
+	var in struct {
+		BaseRevision   int             `json:"base_revision"`
+		IdempotencyKey string          `json:"idempotency_key"`
+		Operations     json.RawMessage `json:"operations"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", fmt.Errorf("bad arguments: %v", err)
+	}
+	pid := projectID()
+	if pid == "" {
+		return "", fmt.Errorf("no project id: set GODLOOP_PROJECT or create a .godloop file")
+	}
+	if in.BaseRevision < 1 || len(in.Operations) == 0 {
+		return "", fmt.Errorf("base_revision and operations are required")
+	}
+	idempotencyKey := strings.TrimSpace(in.IdempotencyKey)
+	if idempotencyKey == "" {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:", pid, in.BaseRevision) + string(in.Operations)))
+		idempotencyKey = fmt.Sprintf("godloop:auto:%x", sum[:16])
+	}
+	return callAPI("POST", "/api/v1/mcp/integrations/masterplan/changes", map[string]any{
+		"project_id":      pid,
+		"base_revision":   in.BaseRevision,
+		"idempotency_key": idempotencyKey,
+		"operations":      in.Operations,
+	})
+}
 
 // callAPI performs one authenticated REST call and renders the {data:...}
 // envelope as indented JSON (agents parse it fine and humans can read logs).

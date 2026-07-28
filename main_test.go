@@ -125,6 +125,48 @@ func TestConfiguredMaxPromptChars(t *testing.T) {
 	}
 }
 
+func TestMasterplanToolUsesGodloopWithoutReceivingIntegrationCredential(t *testing.T) {
+	var gotAuthorization string
+	var got map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthorization = r.Header.Get("X-Godloop-Key")
+		if r.URL.Path != "/api/v1/mcp/integrations/masterplan/changes" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"revision":3,"applied":1,"idempotent":false}}`))
+	}))
+	defer server.Close()
+
+	t.Setenv("GODLOOP_URL", server.URL)
+	t.Setenv("GODLOOP_KEY", "glp_agent_key")
+	t.Setenv("GODLOOP_PROJECT", "portfolio-project")
+	args := json.RawMessage(`{"base_revision":2,"operations":[{"op":"update","id":"auralarp","fields":{"progress":25}}]}`)
+	result, err := callMasterplanTool(args)
+	if err != nil {
+		t.Fatalf("call masterplan tool: %v", err)
+	}
+	if !strings.Contains(result, `"revision": 3`) {
+		t.Fatalf("unexpected result: %s", result)
+	}
+	if gotAuthorization != "glp_agent_key" {
+		t.Fatalf("Godloop key = %q", gotAuthorization)
+	}
+	if got["project_id"] != "portfolio-project" {
+		t.Fatalf("project_id = %#v", got["project_id"])
+	}
+	key, _ := got["idempotency_key"].(string)
+	if !strings.HasPrefix(key, "godloop:auto:") {
+		t.Fatalf("generated idempotency key = %q", key)
+	}
+	if _, leaked := got["token"]; leaked {
+		t.Fatal("MCP client sent an integration credential")
+	}
+}
+
 func TestCallLoopSendsBoundedPromptRequest(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("GODLOOP_KEY", "glp_test")

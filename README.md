@@ -9,12 +9,16 @@ This repo ships two binaries:
 - `godloop`: the local runner CLI. Use this first.
 - `godloop-mcp`: the stdio MCP connector for native MCP sessions.
 
+The MCP connector also exposes a scoped `masterplan` tool for Joe's configured
+portfolio project. It can add and update public plan nodes through Godloop, but
+cannot delete nodes or read the server-side integration credential.
+
 ## Install the runner
 
 With Go:
 
 ```bash
-go install github.com/godloopai/godloop-mcp/cmd/godloop@v0.4.0-alpha
+go install github.com/godloopai/godloop-mcp/cmd/godloop@v0.5.0-alpha
 godloop
 ```
 
