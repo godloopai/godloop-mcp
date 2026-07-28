@@ -10,26 +10,77 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 )
 
+// --- read-only project dashboard tool ---
+
+var projectsTool = map[string]any{
+	"name":        "projects",
+	"description": "Read live Godloop project status without claiming work. Use `current` for the repository selected by its .godloop file, or `overview` for every project. Returns runner presence, task/Loop/Godloop counts, inbox counts, and the latest active or completed run.",
+	"inputSchema": map[string]any{
+		"type":     "object",
+		"required": []string{"action"},
+		"properties": map[string]any{
+			"action": map[string]any{
+				"type": "string",
+				"enum": []string{"current", "overview"},
+			},
+			"project_id": map[string]any{
+				"type":        "string",
+				"description": "Optional override for `current`; defaults to the repository's .godloop file.",
+			},
+		},
+	},
+}
+
+func callProjectsTool(args json.RawMessage) (string, error) {
+	var in struct {
+		Action    string `json:"action"`
+		ProjectID string `json:"project_id"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", fmt.Errorf("bad arguments: %v", err)
+	}
+	switch in.Action {
+	case "overview":
+		return callAPI("GET", "/api/v1/mcp/projects", nil)
+	case "current":
+		pid := strings.TrimSpace(in.ProjectID)
+		if pid == "" {
+			pid = projectID()
+		}
+		if pid == "" {
+			return "", fmt.Errorf("no project id: pass project_id or create a .godloop file")
+		}
+		return callAPI("GET", "/api/v1/mcp/projects?project_id="+url.QueryEscape(pid), nil)
+	default:
+		return "", fmt.Errorf("unknown action %q; valid: current, overview", in.Action)
+	}
+}
+
 // --- public masterplan tool ---
 
 var masterplanTool = map[string]any{
 	"name": "masterplan",
-	"description": "Add or update public items in Joe's masterplan through Godloop's scoped server-side connector. " +
+	"description": "Read Joe's public masterplan, or add/update public items through Godloop's scoped server-side connector. " +
 		"The tool cannot delete items, access private app data, or reveal the integration credential. " +
-		"Read https://joetann.com/api/masterplan first and pass its current revision as base_revision.",
+		"Always use action `read` first, then pass that revision to action `change`.",
 	"inputSchema": map[string]any{
-		"type":     "object",
-		"required": []string{"base_revision", "operations"},
+		"type": "object",
 		"properties": map[string]any{
+			"action": map[string]any{
+				"type":        "string",
+				"enum":        []string{"read", "change"},
+				"description": "Read the public plan or submit bounded add/update operations. Omitted means change for compatibility.",
+			},
 			"base_revision": map[string]any{
 				"type":        "integer",
 				"minimum":     1,
-				"description": "Current revision from the public masterplan JSON.",
+				"description": "Required for change: current revision returned by action read.",
 			},
 			"idempotency_key": map[string]any{
 				"type":        "string",
@@ -57,12 +108,19 @@ var masterplanTool = map[string]any{
 
 func callMasterplanTool(args json.RawMessage) (string, error) {
 	var in struct {
+		Action         string          `json:"action"`
 		BaseRevision   int             `json:"base_revision"`
 		IdempotencyKey string          `json:"idempotency_key"`
 		Operations     json.RawMessage `json:"operations"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil {
 		return "", fmt.Errorf("bad arguments: %v", err)
+	}
+	if in.Action == "read" {
+		return readPublicMasterplan()
+	}
+	if in.Action != "" && in.Action != "change" {
+		return "", fmt.Errorf("unknown action %q; valid: read, change", in.Action)
 	}
 	pid := projectID()
 	if pid == "" {
@@ -82,6 +140,31 @@ func callMasterplanTool(args json.RawMessage) (string, error) {
 		"idempotency_key": idempotencyKey,
 		"operations":      in.Operations,
 	})
+}
+
+func readPublicMasterplan() (string, error) {
+	endpoint := strings.TrimSpace(os.Getenv("JOETANN_MASTERPLAN_URL"))
+	if endpoint == "" {
+		endpoint = "https://joetann.com/api/masterplan"
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(endpoint)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	out, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("masterplan api %d: %s", resp.StatusCode, strings.TrimSpace(string(out)))
+	}
+	var pretty bytes.Buffer
+	if json.Indent(&pretty, out, "", "  ") != nil {
+		return strings.TrimSpace(string(out)), nil
+	}
+	return pretty.String(), nil
 }
 
 // callAPI performs one authenticated REST call and renders the {data:...}

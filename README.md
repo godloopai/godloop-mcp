@@ -9,16 +9,17 @@ This repo ships two binaries:
 - `godloop`: the local runner CLI. Use this first.
 - `godloop-mcp`: the stdio MCP connector for native MCP sessions.
 
-The MCP connector also exposes a scoped `masterplan` tool for Joe's configured
-portfolio project. It can add and update public plan nodes through Godloop, but
-cannot delete nodes or read the server-side integration credential.
+The MCP connector also exposes a read-only project dashboard and a scoped
+`masterplan` tool for Joe's configured portfolio project. It can read the
+public plan and add/update public nodes through Godloop, but cannot delete
+nodes or read the server-side integration credential.
 
 ## Install the runner
 
 With Go:
 
 ```bash
-go install github.com/godloopai/godloop-mcp/cmd/godloop@v0.5.0-alpha
+go install github.com/godloopai/godloop-mcp/cmd/godloop@v0.6.0-alpha
 godloop
 ```
 
@@ -64,6 +65,18 @@ work queued from the dashboard and checks for new work about every 10 seconds.
 It uses outbound HTTPS with your runner key; the service does not SSH into your
 machine.
 
+For a workspace with several repositories, point the runner at their common
+parent:
+
+```bash
+godloop run -workdir /path/to/projects/godloop -projects-root /path/to/projects
+```
+
+Before claiming work, the runner verifies that a checkout's `.godloop` matches
+the server project. If a saved location is stale it finds a unique matching
+direct child under `-projects-root`; missing or ambiguous mappings are skipped
+instead of running work in the wrong repository.
+
 By default, Codex runs with `--sandbox danger-full-access` so local shell tools
 work on hosts where Codex's bubblewrap sandbox cannot create network namespaces.
 Run godloop only in repos and machines you trust, or put the whole runner inside
@@ -106,8 +119,24 @@ go install github.com/godloopai/godloop-mcp@latest
 Or download `godloop-mcp_<platform>_<arch>` from
 [Releases](https://github.com/godloopai/godloop-mcp/releases).
 
-`godloop-mcp` exposes three MCP tools: `loop` (the tick), `loops` (CRUD your
-loop templates), and `godloop` (compose and drive godloops) — see Tools below.
+`godloop-mcp` exposes five MCP tools: `loop` (the tick), `projects` (read-only
+status), `loops` (CRUD your loop templates), `godloop` (compose and drive
+godloops), and `masterplan` — see Tools below.
+
+## Register with Codex
+
+Register the connector once in your user config:
+
+```bash
+codex mcp add godloop -- godloop-mcp
+```
+
+When authentication comes from `godloop login`, use a small wrapper that reads
+`~/.config/godloop/config.json` at startup and exports `GODLOOP_KEY` and
+`GODLOOP_URL` before launching `godloop-mcp`. Codex stores user-level MCP
+servers in `~/.codex/config.toml`; every trusted repository then selects its
+project through its local `.godloop` file. Restart Codex (not your shell) after
+adding or updating the connector.
 
 ## Register with Claude Code
 
@@ -130,6 +159,9 @@ echo '<project-id>' > .godloop
 - `loop` — the tick: call at the top of every /loop iteration. Reports the
   previous tick, returns the next task, usage across your AI subs, and when
   to call again.
+- `projects` — read-only live status. `current` uses the repository's
+  `.godloop`; `overview` returns the cross-project dashboard with runner,
+  task, Loop, Godloop, inbox, and latest-run status.
 - `loops` — CRUD your loop templates (`list | get | create | update | delete`).
   `get` an existing loop to learn the `config_json` steps shape. Visibility can
   be set to `private`/`unlisted`; publishing to the marketplace needs the
@@ -141,6 +173,9 @@ echo '<project-id>' > .godloop
   drive a godloop assigned to a project: `get` returns members in order plus an
   `active` block with the running member index and cycle number; `reorder`
   mid-cycle lets the running loop finish and applies the new order after it.
+- `masterplan` — `read` returns Joe's public masterplan; `change` submits
+  bounded add/update operations using the returned revision. Delete is not
+  exposed.
 
 `loops` and `godloop` need the same paid `GODLOOP_KEY` as `loop`.
 

@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-const version = "0.5.0-alpha"
+const version = "0.6.0-alpha"
 
 const (
 	defaultMaxPromptChars = 4000
@@ -654,11 +654,14 @@ func main() {
 				"protocolVersion": "2024-11-05",
 				"capabilities":    map[string]any{"tools": map[string]any{}},
 				"serverInfo":      map[string]any{"name": "godloop", "version": version},
+				"instructions": "This connector is already authenticated. The current repository's .godloop file selects its Godloop project automatically. " +
+					"Use projects current for live repository status and projects overview for the cross-project dashboard. " +
+					"Use masterplan read before masterplan changes. The loop tool claims queued work; do not call it merely to inspect status.",
 			})
 		case "notifications/initialized":
 			// notification, no response
 		case "tools/list":
-			reply(req.ID, map[string]any{"tools": []any{loopTool, loopsTool, godloopTool, masterplanTool}})
+			reply(req.ID, map[string]any{"tools": []any{loopTool, projectsTool, loopsTool, godloopTool, masterplanTool}})
 		case "tools/call":
 			var p struct {
 				Name      string          `json:"name"`
@@ -670,6 +673,8 @@ func main() {
 			switch p.Name {
 			case "loop":
 				text, err = callLoop(p.Arguments)
+			case "projects":
+				text, err = callProjectsTool(p.Arguments)
 			case "loops":
 				text, err = callLoopsTool(p.Arguments)
 			case "godloop":

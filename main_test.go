@@ -144,7 +144,7 @@ func TestMasterplanToolUsesGodloopWithoutReceivingIntegrationCredential(t *testi
 	t.Setenv("GODLOOP_URL", server.URL)
 	t.Setenv("GODLOOP_KEY", "glp_agent_key")
 	t.Setenv("GODLOOP_PROJECT", "portfolio-project")
-	args := json.RawMessage(`{"base_revision":2,"operations":[{"op":"update","id":"auralarp","fields":{"progress":25}}]}`)
+	args := json.RawMessage(`{"action":"change","base_revision":2,"operations":[{"op":"update","id":"auralarp","fields":{"progress":25}}]}`)
 	result, err := callMasterplanTool(args)
 	if err != nil {
 		t.Fatalf("call masterplan tool: %v", err)
@@ -164,6 +164,50 @@ func TestMasterplanToolUsesGodloopWithoutReceivingIntegrationCredential(t *testi
 	}
 	if _, leaked := got["token"]; leaked {
 		t.Fatal("MCP client sent an integration credential")
+	}
+}
+
+func TestMasterplanToolReadsPublicPlan(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Godloop-Key"); got != "" {
+			t.Fatalf("public read sent auth header %q", got)
+		}
+		_, _ = w.Write([]byte(`{"revision":4,"nodes":[{"id":"godloop"}]}`))
+	}))
+	defer server.Close()
+	t.Setenv("JOETANN_MASTERPLAN_URL", server.URL)
+
+	result, err := callMasterplanTool(json.RawMessage(`{"action":"read"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"revision": 4`) || !strings.Contains(result, `"godloop"`) {
+		t.Fatalf("unexpected result: %s", result)
+	}
+}
+
+func TestProjectsToolUsesCurrentRepoOrOverview(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.RequestURI())
+		if r.Header.Get("X-Godloop-Key") != "glp_agent_key" {
+			t.Fatalf("missing Godloop key")
+		}
+		_, _ = w.Write([]byte(`{"data":{"projects":[]}}`))
+	}))
+	defer server.Close()
+	t.Setenv("GODLOOP_URL", server.URL)
+	t.Setenv("GODLOOP_KEY", "glp_agent_key")
+	t.Setenv("GODLOOP_PROJECT", "project with space")
+
+	if _, err := callProjectsTool(json.RawMessage(`{"action":"current"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callProjectsTool(json.RawMessage(`{"action":"overview"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 2 || paths[0] != "/api/v1/mcp/projects?project_id=project+with+space" || paths[1] != "/api/v1/mcp/projects" {
+		t.Fatalf("paths = %#v", paths)
 	}
 }
 
