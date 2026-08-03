@@ -62,45 +62,50 @@ func callProjectsTool(args json.RawMessage) (string, error) {
 	}
 }
 
-// --- public masterplan tool ---
+// --- native account masterplan tool ---
 
 var masterplanTool = map[string]any{
 	"name": "masterplan",
-	"description": "Read Joe's public masterplan, or add/update public items through Godloop's scoped server-side connector. " +
-		"The tool cannot delete items, access private app data, or reveal the integration credential. " +
-		"Always use action `read` first, then pass that revision to action `change`.",
+	"description": "Read or safely modify the authenticated user's native Godloop masterplan. " +
+		"It contains workspace goals plus project-linked project, task, and milestone nodes with dates, status, progress, budget, colors, and KPI targets. " +
+		"Always read first and pass the exact revision to create/update/delete. Delete requires confirm_node_id to exactly repeat node_id.",
 	"inputSchema": map[string]any{
-		"type": "object",
+		"type":     "object",
+		"required": []string{"action"},
 		"properties": map[string]any{
 			"action": map[string]any{
 				"type":        "string",
-				"enum":        []string{"read", "change"},
-				"description": "Read the public plan or submit bounded add/update operations. Omitted means change for compatibility.",
+				"enum":        []string{"read", "create", "update", "delete"},
+				"description": "Read the plan or change one exact node.",
+			},
+			"project_id": map[string]any{
+				"type":        "string",
+				"description": "Optional project scope override. Defaults to the current repository's .godloop file.",
 			},
 			"base_revision": map[string]any{
 				"type":        "integer",
 				"minimum":     1,
-				"description": "Required for change: current revision returned by action read.",
+				"description": "Required for create/update/delete: exact revision returned by read.",
 			},
-			"idempotency_key": map[string]any{
+			"node_id": map[string]any{
 				"type":        "string",
-				"description": "Optional stable key for this intended change. A deterministic key is generated when omitted.",
+				"description": "Required for update/delete: exact node id returned by read.",
 			},
-			"operations": map[string]any{
-				"type":     "array",
-				"minItems": 1,
-				"maxItems": 20,
-				"items": map[string]any{
-					"type":        "object",
-					"description": "Use {op:'add',node:{...}} for a full public node, or {op:'update',id:'node-id',fields:{...}}. Update fields are title, summary, goal, status, start, end, lane, progress, budget, and url. Delete, id, parent_id, and kind updates are unavailable.",
-					"properties": map[string]any{
-						"op":     map[string]any{"type": "string", "enum": []string{"add", "update"}},
-						"id":     map[string]any{"type": "string"},
-						"node":   map[string]any{"type": "object"},
-						"fields": map[string]any{"type": "object"},
-					},
-					"required": []string{"op"},
-				},
+			"confirm_node_id": map[string]any{
+				"type":        "string",
+				"description": "Required for delete and must exactly repeat node_id.",
+			},
+			"workspace_global": map[string]any{
+				"type":        "boolean",
+				"description": "For create only: true leaves the node account-global instead of linking it to the selected project.",
+			},
+			"node": map[string]any{
+				"type":        "object",
+				"description": "For create: kind, title, status, optional parent_id/summary/goal/start/end/progress/budget/color/sort_order/kpis. The connector generates a stable id when omitted.",
+			},
+			"fields": map[string]any{
+				"type":        "object",
+				"description": "For update: only requested node fields. project_id or parent_id may be null to unlink/make top-level.",
 			},
 		},
 	},
@@ -108,63 +113,71 @@ var masterplanTool = map[string]any{
 
 func callMasterplanTool(args json.RawMessage) (string, error) {
 	var in struct {
-		Action         string          `json:"action"`
-		BaseRevision   int             `json:"base_revision"`
-		IdempotencyKey string          `json:"idempotency_key"`
-		Operations     json.RawMessage `json:"operations"`
+		Action          string         `json:"action"`
+		ProjectID       string         `json:"project_id"`
+		BaseRevision    int64          `json:"base_revision"`
+		NodeID          string         `json:"node_id"`
+		ConfirmNodeID   string         `json:"confirm_node_id"`
+		WorkspaceGlobal bool           `json:"workspace_global"`
+		Node            map[string]any `json:"node"`
+		Fields          map[string]any `json:"fields"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil {
 		return "", fmt.Errorf("bad arguments: %v", err)
 	}
-	if in.Action == "read" {
-		return readPublicMasterplan()
-	}
-	if in.Action != "" && in.Action != "change" {
-		return "", fmt.Errorf("unknown action %q; valid: read, change", in.Action)
-	}
-	pid := projectID()
+	pid := strings.TrimSpace(in.ProjectID)
 	if pid == "" {
-		return "", fmt.Errorf("no project id: set GODLOOP_PROJECT or create a .godloop file")
+		pid = projectID()
 	}
-	if in.BaseRevision < 1 || len(in.Operations) == 0 {
-		return "", fmt.Errorf("base_revision and operations are required")
+	switch in.Action {
+	case "read":
+		path := "/api/v1/mcp/masterplan"
+		if pid != "" {
+			path += "?project_id=" + url.QueryEscape(pid)
+		}
+		return callAPI("GET", path, nil)
+	case "create":
+		if in.BaseRevision < 1 || len(in.Node) == 0 {
+			return "", fmt.Errorf("base_revision and node are required")
+		}
+		node := cloneObject(in.Node)
+		node["base_revision"] = in.BaseRevision
+		if _, ok := node["id"]; !ok {
+			encoded, _ := json.Marshal(node)
+			sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:", pid, in.BaseRevision) + string(encoded)))
+			node["id"] = fmt.Sprintf("mp_%x", sum[:10])
+		}
+		if _, supplied := node["project_id"]; !supplied && !in.WorkspaceGlobal && pid != "" {
+			node["project_id"] = pid
+		}
+		return callAPI("POST", "/api/v1/mcp/masterplan/nodes", node)
+	case "update":
+		nodeID := strings.TrimSpace(in.NodeID)
+		if in.BaseRevision < 1 || nodeID == "" || len(in.Fields) == 0 {
+			return "", fmt.Errorf("base_revision, node_id, and fields are required")
+		}
+		fields := cloneObject(in.Fields)
+		fields["base_revision"] = in.BaseRevision
+		return callAPI("PATCH", "/api/v1/mcp/masterplan/nodes/"+url.PathEscape(nodeID), fields)
+	case "delete":
+		nodeID := strings.TrimSpace(in.NodeID)
+		if in.BaseRevision < 1 || nodeID == "" || strings.TrimSpace(in.ConfirmNodeID) != nodeID {
+			return "", fmt.Errorf("base_revision and an exact confirm_node_id are required")
+		}
+		return callAPI("DELETE", "/api/v1/mcp/masterplan/nodes/"+url.PathEscape(nodeID), map[string]any{
+			"base_revision": in.BaseRevision, "confirm_node_id": nodeID,
+		})
+	default:
+		return "", fmt.Errorf("unknown action %q; valid: read, create, update, delete", in.Action)
 	}
-	idempotencyKey := strings.TrimSpace(in.IdempotencyKey)
-	if idempotencyKey == "" {
-		sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:", pid, in.BaseRevision) + string(in.Operations)))
-		idempotencyKey = fmt.Sprintf("godloop:auto:%x", sum[:16])
-	}
-	return callAPI("POST", "/api/v1/mcp/integrations/masterplan/changes", map[string]any{
-		"project_id":      pid,
-		"base_revision":   in.BaseRevision,
-		"idempotency_key": idempotencyKey,
-		"operations":      in.Operations,
-	})
 }
 
-func readPublicMasterplan() (string, error) {
-	endpoint := strings.TrimSpace(os.Getenv("JOETANN_MASTERPLAN_URL"))
-	if endpoint == "" {
-		endpoint = "https://joetann.com/api/masterplan"
+func cloneObject(input map[string]any) map[string]any {
+	out := make(map[string]any, len(input)+2)
+	for key, value := range input {
+		out[key] = value
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(endpoint)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	out, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return "", err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("masterplan api %d: %s", resp.StatusCode, strings.TrimSpace(string(out)))
-	}
-	var pretty bytes.Buffer
-	if json.Indent(&pretty, out, "", "  ") != nil {
-		return strings.TrimSpace(string(out)), nil
-	}
-	return pretty.String(), nil
+	return out
 }
 
 // callAPI performs one authenticated REST call and renders the {data:...}

@@ -9,10 +9,10 @@ This repo ships two binaries:
 - `godloop`: the local runner CLI. Use this first.
 - `godloop-mcp`: the stdio MCP connector for native MCP sessions.
 
-The MCP connector also exposes a read-only project dashboard and a scoped
-`masterplan` tool for Joe's configured portfolio project. It can read the
-public plan and add/update public nodes through Godloop, but cannot delete
-nodes or read the server-side integration credential.
+The MCP connector also exposes a read-only project dashboard and an
+account-native `masterplan` tool. It reads the authenticated user's living plan
+and safely creates, updates, or explicitly confirmed-deletes project-linked
+nodes through Godloop.
 
 ## Install the runner
 
@@ -173,9 +173,9 @@ echo '<project-id>' > .godloop
   drive a godloop assigned to a project: `get` returns members in order plus an
   `active` block with the running member index and cycle number; `reorder`
   mid-cycle lets the running loop finish and applies the new order after it.
-- `masterplan` — `read` returns Joe's public masterplan; `change` submits
-  bounded add/update operations using the returned revision. Delete is not
-  exposed.
+- `masterplan` — `read` returns the authenticated account masterplan.
+  `create | update | delete` change one node using the exact returned revision;
+  delete additionally requires `confirm_node_id` to repeat the target id.
 
 `loops` and `godloop` need the same paid `GODLOOP_KEY` as `loop`.
 
