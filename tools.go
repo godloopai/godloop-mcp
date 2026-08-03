@@ -1,6 +1,5 @@
-// CRUD tools: `loops` (your loop templates) and `godloop` (compose/inspect
-// godloops). Thin wrappers over the key-authed /api/v1/mcp/* REST surface —
-// action-discriminated so the tool list stays small.
+// Thin wrappers over the key-authenticated /api/v1/mcp/* REST surface. Related
+// actions share one tool so the MCP surface stays small.
 package main
 
 import (
@@ -166,6 +165,88 @@ func callMasterplanTool(args json.RawMessage) (string, error) {
 		}
 		return callAPI("DELETE", "/api/v1/mcp/masterplan/nodes/"+url.PathEscape(nodeID), map[string]any{
 			"base_revision": in.BaseRevision, "confirm_node_id": nodeID,
+		})
+	default:
+		return "", fmt.Errorf("unknown action %q; valid: read, create, update, delete", in.Action)
+	}
+}
+
+// --- safe project dashboard tool ---
+
+var dashboardsTool = map[string]any{
+	"name": "dashboards",
+	"description": "Read or modify the current project's live Godloop dashboards. " +
+		"A project can have multiple dashboards made from safe metric, status, progress, text, and list widgets. " +
+		"Always read first and pass the exact dashboard revision to update or delete; arbitrary HTML and scripts are not accepted.",
+	"inputSchema": map[string]any{
+		"type":     "object",
+		"required": []string{"action"},
+		"properties": map[string]any{
+			"action": map[string]any{
+				"type": "string", "enum": []string{"read", "create", "update", "delete"},
+			},
+			"project_id": map[string]any{
+				"type": "string", "description": "Optional project override; defaults to the current repository's .godloop file.",
+			},
+			"dashboard_id": map[string]any{
+				"type": "string", "description": "Required for update/delete: exact id returned by read.",
+			},
+			"base_revision": map[string]any{
+				"type": "integer", "minimum": 1, "description": "Required for update/delete: exact revision returned by read.",
+			},
+			"confirm_dashboard_id": map[string]any{
+				"type": "string", "description": "Required for delete and must exactly repeat dashboard_id.",
+			},
+			"definition": map[string]any{
+				"type": "object", "description": "Full create/update definition: optional id, title, summary, sort_order, and widgets. Each widget has a unique id, kind, title, and optional source/value/detail/tone/progress/span/items.",
+			},
+		},
+	},
+}
+
+func callDashboardsTool(args json.RawMessage) (string, error) {
+	var in struct {
+		Action             string         `json:"action"`
+		ProjectID          string         `json:"project_id"`
+		DashboardID        string         `json:"dashboard_id"`
+		BaseRevision       int64          `json:"base_revision"`
+		ConfirmDashboardID string         `json:"confirm_dashboard_id"`
+		Definition         map[string]any `json:"definition"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", fmt.Errorf("bad arguments: %v", err)
+	}
+	pid := strings.TrimSpace(in.ProjectID)
+	if pid == "" {
+		pid = projectID()
+	}
+	if pid == "" {
+		return "", fmt.Errorf("no project id: pass project_id or create a .godloop file")
+	}
+	collection := "/api/v1/mcp/projects/" + url.PathEscape(pid) + "/dashboards"
+	switch in.Action {
+	case "read":
+		return callAPI("GET", collection, nil)
+	case "create":
+		if len(in.Definition) == 0 {
+			return "", fmt.Errorf("definition is required")
+		}
+		return callAPI("POST", collection, in.Definition)
+	case "update":
+		dashboardID := strings.TrimSpace(in.DashboardID)
+		if dashboardID == "" || in.BaseRevision < 1 || len(in.Definition) == 0 {
+			return "", fmt.Errorf("dashboard_id, base_revision, and a full definition are required")
+		}
+		definition := cloneObject(in.Definition)
+		definition["base_revision"] = in.BaseRevision
+		return callAPI("PUT", collection+"/"+url.PathEscape(dashboardID), definition)
+	case "delete":
+		dashboardID := strings.TrimSpace(in.DashboardID)
+		if dashboardID == "" || in.BaseRevision < 1 || strings.TrimSpace(in.ConfirmDashboardID) != dashboardID {
+			return "", fmt.Errorf("dashboard_id, base_revision, and an exact confirm_dashboard_id are required")
+		}
+		return callAPI("DELETE", collection+"/"+url.PathEscape(dashboardID), map[string]any{
+			"base_revision": in.BaseRevision, "confirm_dashboard_id": dashboardID,
 		})
 	default:
 		return "", fmt.Errorf("unknown action %q; valid: read, create, update, delete", in.Action)

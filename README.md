@@ -119,9 +119,9 @@ go install github.com/godloopai/godloop-mcp@latest
 Or download `godloop-mcp_<platform>_<arch>` from
 [Releases](https://github.com/godloopai/godloop-mcp/releases).
 
-`godloop-mcp` exposes five MCP tools: `loop` (the tick), `projects` (read-only
+`godloop-mcp` exposes six MCP tools: `loop` (the tick), `projects` (read-only
 status), `loops` (CRUD your loop templates), `godloop` (compose and drive
-godloops), and `masterplan` — see Tools below.
+godloops), `masterplan`, and `dashboards` — see Tools below.
 
 ## Register with Codex
 
@@ -176,8 +176,11 @@ echo '<project-id>' > .godloop
 - `masterplan` — `read` returns the authenticated account masterplan.
   `create | update | delete` change one node using the exact returned revision;
   delete additionally requires `confirm_node_id` to repeat the target id.
+- `dashboards` — `read` returns every live dashboard for the current project
+  plus its status data. `create | update | delete` manage safe structured widget
+  dashboards; update/delete require the exact dashboard revision from `read`.
 
-`loops` and `godloop` need the same paid `GODLOOP_KEY` as `loop`.
+All authoring tools need the same paid `GODLOOP_KEY` as `loop`.
 
 ## Config
 

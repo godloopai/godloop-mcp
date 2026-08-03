@@ -218,6 +218,53 @@ func TestProjectsToolUsesCurrentRepoOrOverview(t *testing.T) {
 	}
 }
 
+func TestDashboardsToolUsesCurrentProjectAndRevisionSafeWrites(t *testing.T) {
+	var methods, paths []string
+	var bodies []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		methods = append(methods, r.Method)
+		paths = append(paths, r.URL.Path)
+		if r.Body != nil && r.Method != http.MethodGet {
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			bodies = append(bodies, body)
+		}
+		_, _ = w.Write([]byte(`{"data":{"dashboards":[]}}`))
+	}))
+	defer server.Close()
+	t.Setenv("GODLOOP_URL", server.URL)
+	t.Setenv("GODLOOP_KEY", "glp_agent_key")
+	t.Setenv("GODLOOP_PROJECT", "project-one")
+
+	if _, err := callDashboardsTool(json.RawMessage(`{"action":"read"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callDashboardsTool(json.RawMessage(`{"action":"create","definition":{"title":"Release health","widgets":[]}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callDashboardsTool(json.RawMessage(`{"action":"update","dashboard_id":"release-health","base_revision":3,"definition":{"title":"Ship health","widgets":[]}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callDashboardsTool(json.RawMessage(`{"action":"delete","dashboard_id":"release-health","base_revision":4,"confirm_dashboard_id":"release-health"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 4 || paths[0] != "/api/v1/mcp/projects/project-one/dashboards" ||
+		paths[2] != "/api/v1/mcp/projects/project-one/dashboards/release-health" {
+		t.Fatalf("paths = %#v", paths)
+	}
+	if methods[0] != http.MethodGet || methods[1] != http.MethodPost || methods[2] != http.MethodPut || methods[3] != http.MethodDelete {
+		t.Fatalf("methods = %#v", methods)
+	}
+	if bodies[1]["base_revision"] != float64(3) || bodies[2]["confirm_dashboard_id"] != "release-health" {
+		t.Fatalf("revision-safe bodies = %#v", bodies)
+	}
+	if _, err := callDashboardsTool(json.RawMessage(`{"action":"delete","dashboard_id":"x","base_revision":1,"confirm_dashboard_id":"wrong"}`)); err == nil {
+		t.Fatal("dashboard delete without exact confirmation was accepted")
+	}
+}
+
 func TestCallLoopSendsBoundedPromptRequest(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("GODLOOP_KEY", "glp_test")

@@ -1,7 +1,5 @@
-// godloop-mcp: tiny stdio MCP server exposing one tool, "loop".
-// Call it at the top of every /loop tick: it reports the previous tick,
-// returns the next task to work on, usage across your AI subs, and when
-// to schedule the next tick.
+// godloop-mcp is a small stdio MCP server for project status, live planning,
+// dashboards, loops, godloops, and the autonomous loop tick.
 //
 // Config: GODLOOP_KEY (required), GODLOOP_URL (default https://godloop.ai),
 // project id from ./.godloop (raw public id, or {"project_id":"..."}).
@@ -22,7 +20,7 @@ import (
 	"time"
 )
 
-const version = "0.7.0-alpha"
+const version = "0.8.0-alpha"
 
 const (
 	defaultMaxPromptChars = 4000
@@ -656,12 +654,12 @@ func main() {
 				"serverInfo":      map[string]any{"name": "godloop", "version": version},
 				"instructions": "This connector is already authenticated. The current repository's .godloop file selects its Godloop project automatically. " +
 					"Use projects current for live repository status and projects overview for the cross-project dashboard. " +
-					"Use masterplan read before masterplan changes. The loop tool claims queued work; do not call it merely to inspect status.",
+					"Use masterplan and dashboards read before changing project views. The loop tool claims queued work; do not call it merely to inspect status.",
 			})
 		case "notifications/initialized":
 			// notification, no response
 		case "tools/list":
-			reply(req.ID, map[string]any{"tools": []any{loopTool, projectsTool, loopsTool, godloopTool, masterplanTool}})
+			reply(req.ID, map[string]any{"tools": []any{loopTool, projectsTool, loopsTool, godloopTool, masterplanTool, dashboardsTool}})
 		case "tools/call":
 			var p struct {
 				Name      string          `json:"name"`
@@ -681,6 +679,8 @@ func main() {
 				text, err = callGodloopTool(p.Arguments)
 			case "masterplan":
 				text, err = callMasterplanTool(p.Arguments)
+			case "dashboards":
+				text, err = callDashboardsTool(p.Arguments)
 			default:
 				replyErr(req.ID, -32602, "unknown tool: "+p.Name)
 				continue
